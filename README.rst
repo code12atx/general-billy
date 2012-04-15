@@ -1,21 +1,15 @@
-billy
+general-billy
 =====
 
-billy is a suite of tools developed as a part of `Open States <http://openstates.org>`_ that provide a framework for scraping, storing, and sharing legislative information.
+General Billy is/will be a generalization of `Sunlight Labs' <sunlightlabs.org>`_ `billy <https://github.com/sunlightlabs/billy>`_, a suite of tools developed as a part of `Open States <http://openstates.org>`_ that provide a framework for scraping, storing, and sharing legislative information. The idea here is to generalize that to be potentially useful in ANY situation where:
 
-Features:
+#) a group of individuals are engaged in creating and codifying rules or proclamations; and
+#) the individuals are accountable for their published decisions and actions in this process. 
+
+billy features:
     * Scraper architecture for scraping bills, votes, legislators, committees, and events.
     * Utility scripts for data cleanup and analysis.
     * Bulk data export.
     * Server that includes a data browser and API.
 
-Installation
-------------
-
-billy is available on PyPI and can be installed via ``pip install billy``
-
-PyPI package: http://pypi.python.org/pypi/billy
-
-Source: https://github.com/sunlightlabs/billy/
-
-Documentation: http://billy.readthedocs.org/en/latest/
+Source: https://github.com/code12atx/general-billy/
