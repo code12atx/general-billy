@@ -1,3 +1,12 @@
+General Billy was conceived during Codeathon ATX 2012 by
+Steven Collins <stevencollins@acm.org>. Much thanks for this conception are
+due to Silona Bonewald, whose idea for an opencities project was the catalyst
+for this, and to the tech folks at Blue Goji Games <http://www.bluegoji.com>
+for motivating me to work on my Python and MongoDB skills, which brought opencities
+to my attention.
+
+Authors of billy:
+
 James Turk <jturk@sunlightfoundation.com>
 Michael Stephens <mstephens@sunlightfoundation.com>
 Thom Neale <tneale@sunlightfoundation.com>
