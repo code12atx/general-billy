@@ -1,19 +1,13 @@
-import os
-import json
+import logging
 
 from billy.scrape import Scraper, SourcedObject
+
+logger = logging.getLogger('billy')
 
 
 class BillScraper(Scraper):
 
     scraper_type = 'bills'
-
-    def _get_schema(self):
-        schema_path = os.path.join(os.path.split(__file__)[0],
-                                   '../schemas/bill.json')
-        schema = json.load(open(schema_path))
-        schema['properties']['session']['enum'] = self.all_sessions()
-        return schema
 
     def scrape(self, chamber, session):
         """
@@ -25,16 +19,7 @@ class BillScraper(Scraper):
         """
         raise NotImplementedError('BillScrapers must define a scrape method')
 
-    def save_bill(self, bill):
-        """
-        Save a scraped :class:`~billy.scrape.bills.Bill` object.
-
-        Should be called after all data for the given bill has been collected.
-        """
-        self.log("save_bill %s %s: %s" % (bill['chamber'],
-                                          bill['session'],
-                                          bill['bill_id']))
-        self.save_object(bill)
+    save_bill = Scraper.save_object
 
 
 class Bill(SourcedObject):
@@ -73,6 +58,7 @@ class Bill(SourcedObject):
         self['actions'] = []
         self['documents'] = []
         self['alternate_titles'] = []
+        self['companions'] = []
 
         if not 'type' in kwargs or not kwargs['type']:
             self['type'] = ['bill']
@@ -127,6 +113,8 @@ class Bill(SourcedObject):
         If multiple formats are provided, a good rule of thumb is to
         prefer text, followed by html, followed by pdf/word/etc.
         """
+        if not mimetype:
+            raise ValueError('mimetype parameter to add_version is required')
         if on_duplicate != 'ignore':
             if url in self._seen_versions:
                 if on_duplicate == 'error':
@@ -139,12 +127,11 @@ class Bill(SourcedObject):
                     return       # do nothing
             self._seen_versions.add(url)
 
-        d = dict(name=name, url=url, **kwargs)
-        if mimetype:
-            d['mimetype'] = mimetype
+        d = dict(name=name, url=url, mimetype=mimetype, **kwargs)
         self['versions'].append(d)
 
-    def add_action(self, actor, action, date, type=None, **kwargs):
+    def add_action(self, actor, action, date, type=None, committees=None,
+                   legislators=None, **kwargs):
         """
         Add an action that was performed on this bill.
 
@@ -157,17 +144,46 @@ class Bill(SourcedObject):
                        'Introduced', 'Signed by the Governor', 'Amended'
         :param date: the date/time this action was performed.
         :param type: a type classification for this action
+        ;param committees: a committee or list of committees to associate with
+                           this action
         """
 
-        if not type:
-            type = ['other']
-        elif isinstance(type, basestring):
-            type = [type]
-        elif not isinstance(type, list):
-            type = list(type)
+        def _cleanup_list(obj, default):
+            if not obj:
+                obj = default
+            elif isinstance(obj, basestring):
+                obj = [obj]
+            elif not isinstance(obj, list):
+                obj = list(obj)
+            return obj
+
+        type = _cleanup_list(type, ['other'])
+        committees = _cleanup_list(committees, [])
+        legislators = _cleanup_list(legislators, [])
+
+        if 'committee' in kwargs:
+            raise ValueError("invalid param 'committee' passed to add_action, "
+                             "must use committees")
+
+        if isinstance(committees, basestring):
+            committees = [committees]
+
+        related_entities = []         # OK, let's work some magic.
+        for committee in committees:
+            related_entities.append({
+                "type": "committee",
+                "name": committee
+            })
+
+        for legislator in legislators:
+            related_entities.append({
+                "type": "legislator",
+                "name": legislator
+            })
 
         self['actions'].append(dict(actor=actor, action=action,
                                     date=date, type=type,
+                                    related_entities=related_entities,
                                     **kwargs))
 
     def add_vote(self, vote):
@@ -183,7 +199,22 @@ class Bill(SourcedObject):
         """
         self['alternate_titles'].append(title)
 
+    def add_companion(self, bill_id, session=None, chamber=None):
+        """
+        Associate another bill with this one.
+
+        If session isn't set it will be set to self['session'].
+        """
+        companion = {'bill_id': bill_id,
+                     'session': session or self['session'],
+                     'chamber': chamber}
+        self['companions'].append(companion)
+
     def get_filename(self):
         filename = "%s_%s_%s.json" % (self['session'], self['chamber'],
                                       self['bill_id'])
         return filename.encode('ascii', 'replace')
+
+    def __unicode__(self):
+        return "%s %s: %s" % (self['chamber'], self['session'],
+                              self['bill_id'])

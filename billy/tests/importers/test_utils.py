@@ -4,7 +4,7 @@ import datetime
 
 from nose.tools import with_setup, assert_raises
 
-from billy import db
+from billy.core import db
 from billy.importers import utils
 
 
@@ -24,11 +24,9 @@ def test_insert_with_id_duplicate_id():
 def test_insert_with_id_increments():
     obj1 = {'full_name': 'a test legislator',
             '_type': 'person',
-            'level': 'state',
             'state': 'ex'}
     obj2 = {'full_name': 'another legislator',
             '_type': 'person',
-            'level': 'state',
             'state': 'ex'}
 
     leg_id_re = re.compile(r'^EXL\d{6,6}$')
@@ -52,11 +50,11 @@ def test_insert_with_id_increments():
 
 @with_setup(drop_everything)
 def test_insert_with_id_types():
-    person = {'_type': 'person', 'level': 'state', 'state': 'ex'}
-    legislator = {'_type': 'person', 'level': 'state', 'state': 'ex'}
-    committee = {'_type': 'committee', 'level': 'state', 'state': 'ex'}
-    bill = {'_type': 'bill', 'level': 'state', 'state': 'ex'}
-    other = {'_type': 'other', 'level': 'state', 'state': 'ex'}
+    person = {'_type': 'person', 'state': 'ex'}
+    legislator = {'_type': 'person', 'state': 'ex'}
+    committee = {'_type': 'committee', 'state': 'ex'}
+    bill = {'_type': 'bill', 'state': 'ex'}
+    other = {'_type': 'other', 'state': 'ex'}
 
     assert utils.insert_with_id(person).startswith('EXL')
     assert utils.insert_with_id(legislator).startswith('EXL')
@@ -66,20 +64,9 @@ def test_insert_with_id_types():
 
 
 @with_setup(drop_everything)
-def test_insert_with_idlevels():
-    state_obj = {'_type': 'person', 'level': 'state', 'state': 'ex',
-                 'country': 'us'}
-    country_obj = {'_type': 'person', 'level': 'country', 'state': 'ex',
-                   'country': 'us'}
-    assert utils.insert_with_id(state_obj).startswith('EX')
-    assert utils.insert_with_id(country_obj).startswith('US')
-
-
-@with_setup(db.bills.drop)
 def test_update():
-    obj0 = {'_type': 'bill', 'level': 'state', 'state': 'ex',
-            'field1': 'stuff', 'field2': 'original',
-            '_locked_fields': ['field2']}
+    obj0 = {'_type': 'bill', 'state': 'ex', 'field1': 'stuff',
+            'field2': 'original', '_locked_fields': ['field2']}
 
     id1 = utils.insert_with_id(obj0)
     obj1 = db.bills.find_one(id1)
@@ -106,10 +93,10 @@ def test_update():
     assert obj2['field2'] == 'original'
 
 
-@with_setup(db.bills.drop)
+@with_setup(drop_everything)
 def test_update_sneaky_filter():
-    obj = {'_type': 'bill', 'level': 'state', 'state': 'ex',
-            'normal_field': 1, 'set_field': [1, 2, 3]}
+    obj = {'_type': 'bill', 'state': 'ex', 'normal_field': 1,
+           'set_field': [1, 2, 3]}
 
     def _set_changed(old, new):
         return set(old) != set(new)
@@ -137,14 +124,12 @@ def test_convert_timestamps():
            'actions': [{'when': ts}, {'date': ts}],
            'sources': [{'when': ts}, {'date': ts}],
            'votes': [{'when': ts}, {'date': ts}],
-           'terms': [{'start_date': ts}, {'end_date': ts}],
            }
 
     expect = {'date': dt,
               'actions': [{'when': dt}, {'date': dt}],
               'sources': [{'when': dt}, {'date': dt}],
               'votes': [{'when': dt}, {'date': dt}],
-              'terms': [{'start_date': dt}, {'end_date': dt}],
               }
 
     assert utils.convert_timestamps(obj) == expect
@@ -180,13 +165,10 @@ def test_make_plus_fields():
                          'date': 'now',
                          'superfluous': 42}]}
 
-    expect = {'_type': 'bill', 'bill_id': 'AB 123',
-               'title': 'An Awesome Bill',
-               '+extra_field': 'this is not normal',
-               'actions': [{'actor': 'Tom Cruise',
-                            'action': 'hero',
-                            'date': 'now',
-                            '+superfluous': 42}]}
+    expect = {'_type': 'bill', 'bill_id': 'AB 123', 'title': 'An Awesome Bill',
+              '+extra_field': 'this is not normal',
+              'actions': [{'actor': 'Tom Cruise', 'action': 'hero',
+                           'date': 'now', '+superfluous': 42}]}
 
     plussed = utils.make_plus_fields(bill)
 

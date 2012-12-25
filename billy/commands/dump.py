@@ -8,15 +8,28 @@ import urllib
 import zipfile
 import unicodecsv
 
-from billy.conf import settings
-from billy.utils import metadata, extract_fields
+from billy.core import settings
+from billy.utils import metadata
 from billy.commands import BaseCommand
-from billy import db
+from billy.core import db
 
 import scrapelib
 import validictory
 import boto
 from boto.s3.key import Key
+
+
+def extract_fields(d, fields, delimiter='|'):
+    """ get values out of an object ``d`` for saving to a csv """
+    rd = {}
+    for f in fields:
+        v = d.get(f, None)
+        if isinstance(v, (str, unicode)):
+            v = v.encode('utf8')
+        elif isinstance(v, list):
+            v = delimiter.join(v)
+        rd[f] = v
+    return rd
 
 
 # TODO: make prefix/use_cname configurable
@@ -61,7 +74,7 @@ class APIValidator(validictory.SchemaValidator):
 
 def api_url(path):
     return "%s%s/?apikey=%s" % (settings.API_BASE_URL, urllib.quote(path),
-                                settings.SUNLIGHT_SERVICES_KEY)
+                                settings.API_KEY)
 
 # CSV ################################
 
@@ -73,25 +86,25 @@ def _make_csv(abbr, name, fields):
     return filename, f
 
 
-def dump_legislator_csvs(level, abbr):
+def dump_legislator_csvs(abbr):
     leg_fields = ('leg_id', 'full_name', 'first_name', 'middle_name',
                   'last_name', 'suffixes', 'nickname', 'active',
-                  'level', 'country', 'state', 'chamber', 'district', 'party',
-                  'votesmart_id', 'transparencydata_id', 'photo_url',
-                  'created_at', 'updated_at')
+                  settings.LEVEL_FIELD, 'chamber', 'district', 'party',
+                  'transparencydata_id', 'photo_url', 'created_at',
+                  'updated_at')
     leg_csv_fname, leg_csv = _make_csv(abbr, 'legislators.csv', leg_fields)
 
-    role_fields = ('leg_id', 'type', 'term', 'district', 'chamber', 'level',
-                   'country', 'state', 'party', 'committee_id', 'committee',
+    role_fields = ('leg_id', 'type', 'term', 'district', 'chamber',
+                   settings.LEVEL_FIELD, 'party', 'committee_id', 'committee',
                    'subcommittee', 'start_date', 'end_date')
     role_csv_fname, role_csv = _make_csv(abbr, 'legislator_roles.csv',
                                          role_fields)
 
-    com_fields = ('id', 'level', 'country', 'state', 'chamber', 'committee',
+    com_fields = ('id', settings.LEVEL_FIELD, 'chamber', 'committee',
                   'subcommittee', 'parent_id')
     com_csv_fname, com_csv = _make_csv(abbr, 'committees.csv', com_fields)
 
-    for legislator in db.legislators.find({'level': level, level: abbr}):
+    for legislator in db.legislators.find({settings.LEVEL_FIELD: abbr}):
         leg_csv.writerow(extract_fields(legislator, leg_fields))
 
         # go through roles to create role csv
@@ -104,7 +117,7 @@ def dump_legislator_csvs(level, abbr):
             d.update({'leg_id': legislator['leg_id']})
             role_csv.writerow(d)
 
-    for committee in db.committees.find({'level': level, level: abbr}):
+    for committee in db.committees.find({settings.LEVEL_FIELD: abbr}):
         cdict = extract_fields(committee, com_fields)
         cdict['id'] = committee['_id']
         com_csv.writerow(cdict)
@@ -112,23 +125,23 @@ def dump_legislator_csvs(level, abbr):
     return leg_csv_fname, role_csv_fname, com_csv_fname
 
 
-def dump_bill_csvs(level, abbr):
-    bill_fields = ('level', 'country', 'state', 'session', 'chamber',
+def dump_bill_csvs(abbr):
+    bill_fields = (settings.LEVEL_FIELD, 'session', 'chamber',
                    'bill_id', 'title', 'created_at', 'updated_at', 'type',
                    'subjects')
     bill_csv_fname, bill_csv = _make_csv(abbr, 'bills.csv', bill_fields)
 
-    action_fields = ('level', 'country', 'state', 'session', 'chamber',
+    action_fields = (settings.LEVEL_FIELD, 'session', 'chamber',
                      'bill_id', 'date', 'action', 'actor', 'type')
     action_csv_fname, action_csv = _make_csv(abbr, 'bill_actions.csv',
                                              action_fields)
 
-    sponsor_fields = ('level', 'country', 'state', 'session', 'chamber',
+    sponsor_fields = (settings.LEVEL_FIELD, 'session', 'chamber',
                       'bill_id', 'type', 'name', 'leg_id')
     sponsor_csv_fname, sponsor_csv = _make_csv(abbr, 'bill_sponsors.csv',
                                                sponsor_fields)
 
-    vote_fields = ('level', 'country', 'state', 'session', 'chamber',
+    vote_fields = (settings.LEVEL_FIELD, 'session', 'chamber',
                    'bill_id', 'vote_id', 'vote_chamber', 'motion', 'date',
                    'type', 'yes_count', 'no_count', 'other_count')
     vote_csv_fname, vote_csv = _make_csv(abbr, 'bill_votes.csv', vote_fields)
@@ -138,12 +151,13 @@ def dump_bill_csvs(level, abbr):
                                                'bill_legislator_votes.csv',
                                                legvote_fields)
 
-    for bill in db.bills.find({'level': level, level: abbr}):
+    _bill_info = {}
+    for bill in db.bills.find({settings.LEVEL_FIELD: abbr}):
         bill_csv.writerow(extract_fields(bill, bill_fields))
 
-        bill_info = extract_fields(bill,
-                                   ('bill_id', 'level', 'country', 'state',
-                                    'session', 'chamber'))
+        bill_info = extract_fields(
+            bill, ('bill_id', settings.LEVEL_FIELD, 'session', 'chamber'))
+        _bill_info[bill['_id']] = bill_info
 
         # basically same behavior for actions, sponsors and votes:
         #    extract fields, update with bill_info, write to csv
@@ -157,19 +171,20 @@ def dump_bill_csvs(level, abbr):
             sdict.update(bill_info)
             sponsor_csv.writerow(sdict)
 
-        for vote in bill['votes']:
-            vdict = extract_fields(vote, vote_fields)
-            # copy chamber from vote into vote_chamber
-            vdict['vote_chamber'] = vdict['chamber']
-            vdict.update(bill_info)
-            vote_csv.writerow(vdict)
+    for vote in db.votes.find({settings.LEVEL_FIELD: abbr}):
+        vdict = extract_fields(vote, vote_fields)
+        # copy chamber from vote into vote_chamber
+        vdict['vote_chamber'] = vdict['chamber']
+        vdict.update(_bill_info[vote['bill_id']])
+        vote_csv.writerow(vdict)
 
-            for vtype in ('yes', 'no', 'other'):
-                for leg_vote in vote[vtype + '_votes']:
-                    legvote_csv.writerow({'vote_id': vote['vote_id'],
+        for vtype in ('yes', 'no', 'other'):
+            for leg_vote in vote[vtype + '_votes']:
+                legvote_csv.writerow({'vote_id': vote['vote_id'],
                                       'leg_id': leg_vote['leg_id'],
                                       'name': leg_vote['name'].encode('utf8'),
                                       'vote': vtype})
+
     return (bill_csv_fname, action_csv_fname, sponsor_csv_fname,
             vote_csv_fname, legvote_csv_fname)
 
@@ -180,11 +195,12 @@ class DumpCSV(BaseCommand):
 
     def add_args(self):
         self.add_argument('abbrs', metavar='ABBR', type=str, nargs='+',
-                  help='the two-letter abbreviation for the data to export')
+                          help='the abbreviation for the data to export')
         self.add_argument('--file', '-f',
-                  help='filename to output to (defaults to <abbr>.zip)')
+                          help='filename to output to (defaults to <abbr>.zip)'
+                         )
         self.add_argument('--upload', '-u', action='store_true', default=False,
-                  help='upload the created archives to S3')
+                          help='upload the created archives to S3')
 
     def handle(self, args):
         for abbr in args.abbrs:
@@ -195,11 +211,9 @@ class DumpCSV(BaseCommand):
                 upload(abbr, args.file, 'csv')
 
     def dump(self, abbr, filename):
-        level = metadata(abbr)['level']
-
         files = []
-        files += dump_legislator_csvs(level, abbr)
-        files += dump_bill_csvs(level, abbr)
+        files += dump_legislator_csvs(abbr)
+        files += dump_bill_csvs(abbr)
 
         zfile = zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED)
         for fname in files:
@@ -214,17 +228,18 @@ class DumpJSON(BaseCommand):
 
     def add_args(self):
         self.add_argument('abbrs', metavar='ABBR', type=str, nargs='+',
-                  help='the two-letter abbreviation for the data to export')
+                          help='the abbreviation for the data to export')
         self.add_argument('--file', '-f',
-                  help='filename to output to (defaults to <abbr>.zip)')
+                          help='filename to output to (defaults to <abbr>.zip)'
+                         )
         self.add_argument('--upload', '-u', action='store_true', default=False,
-                  help='upload the created archives to S3')
-        self.add_argument('--sunlight_key', dest='SUNLIGHT_SERVICES_KEY',
-                  help='the Sunlight API key to use')
+                          help='upload the created archives to S3')
+        self.add_argument('--apikey', dest='API_KEY',
+                          help='the API key to use')
         self.add_argument('--schema_dir', default=None,
-                  help='directory to use for API schemas (optional)')
+                          help='directory to use for API schemas (optional)')
         self.add_argument('--novalidate', action='store_true', default=False,
-                  help="don't run validation")
+                          help="don't run validation")
 
     def handle(self, args):
         for abbr in args.abbrs:
@@ -237,7 +252,6 @@ class DumpJSON(BaseCommand):
     def dump(self, abbr, filename, validate, schema_dir):
         scraper = scrapelib.Scraper(requests_per_minute=600,
                                     follow_robots=False)
-        level = metadata(abbr)['level']
 
         zip = zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED)
 
@@ -255,13 +269,12 @@ class DumpJSON(BaseCommand):
             committee_schema = json.load(f)
 
         logging.info('exporting %s bills...' % abbr)
-        for bill in db.bills.find({'level': level, level: abbr},
-                                  timeout=False):
+        for bill in db.bills.find({settings.LEVEL_FIELD: abbr}, timeout=False):
             path = "bills/%s/%s/%s/%s" % (abbr, bill['session'],
                                           bill['chamber'], bill['bill_id'])
             url = api_url(path)
 
-            response = scraper.urlopen(url)
+            response = scraper.urlopen(url).bytes
             if validate:
                 validictory.validate(json.loads(response), bill_schema,
                                      validator_cls=APIValidator)
@@ -269,11 +282,11 @@ class DumpJSON(BaseCommand):
             zip.writestr(path, response)
 
         logging.info('exporting %s legislators...' % abbr)
-        for legislator in db.legislators.find({'level': level, level: abbr}):
+        for legislator in db.legislators.find({settings.LEVEL_FIELD: abbr}):
             path = 'legislators/%s' % legislator['_id']
             url = api_url(path)
 
-            response = scraper.urlopen(url)
+            response = scraper.urlopen(url).bytes
             if validate:
                 validictory.validate(json.loads(response), legislator_schema,
                                      validator_cls=APIValidator)
@@ -281,11 +294,11 @@ class DumpJSON(BaseCommand):
             zip.writestr(path, response)
 
         logging.info('exporting %s committees...' % abbr)
-        for committee in db.committees.find({'level': level, level: abbr}):
+        for committee in db.committees.find({settings.LEVEL_FIELD: abbr}):
             path = 'committees/%s' % committee['_id']
             url = api_url(path)
 
-            response = scraper.urlopen(url)
+            response = scraper.urlopen(url).bytes
             if validate:
                 validictory.validate(json.loads(response), committee_schema,
                                      validator_cls=APIValidator)

@@ -1,13 +1,90 @@
-scrapelib changelog
-===================
+billy changelog
+===============
 
-1.1.0-dev
+1.6.0
 -----
+** 5 December 2012 **
+    * completion of move from 'state' to flexible LEVEL_FIELD
+    * new type: speeches
+    * documentation improvements
+    * beginnings of generic templates for billy.web.public
+    * change to metadata handling of chambers
+    * use updated represent-boundaries instead of django-boundaryservice
+    * bugfix for latest pymongo
+    * basic API tests
+
+1.5.0
+-----
+**1 November 2012**
+    * improved committee_id matching
+    * added bounding box to district polygon API
+    * added 'other_parties' to legislator schema
+    * events: ical support
+    * merging of admin view & public view a bit
+    * introduction of billy.core for settings & dbs
+    * improved action categorization in billy.scrape.actions
+    * bring fulltext processing in to billy
+    * logging colors!
+    * lots of cleanup & deduplication of code
+    * test improvements w/ fixtures now
+
+1.4.0
+-----
+**31 August 2012**
+    * new summary field on bills
+    * enable editing legislators in admin
+    * leg_id view replacing more manual_data csvs
+    * automatically attempt to link actions to votes and bills
+    * support fields API parameter in more places
+    * popularity tracking added
+    * fix to how roles are shown for old legislators
+    * limits to number of items displayed in public view when counts are
+        extremely high
+    * basic user-account & dev-mode support
+    * deeper influence explorer integration
+    * addition of import filters
+    * ability to create data quality exceptions
+    * more tests for models
+
+1.3.0
+-----
+**30 July 2012**
+    * first truly usable version of billy.web.public
+    * remove retire, load_legislators, and prune_committees commands in favor of admin
+    * more admin improvements including subject support and cleaned up reporting
+    * new offices support on legislators
+    * refactor of billy.models
+    * db: denormalize votes into own collection on bill import
+    * db: add action_dates to bills
+    * unification of numerous settings into API_KEY
+    * bugfix for unicode data in dumpjson
+    * bugfix for name matching being too loose from manual_data
+    * bugfix for billy-update deleting metadata without --scrape
+
+1.2.0
+-----
+**29 May 2012**
+    * further development of the public site
+    * use elasticsearch for bill search
+    * improvements to event support
+    * refresh of settings
+        * ENABLE_OYSTER setting replaces --oyster
+        * support for module-specific settings overrides
+    * support for a new scrape signature (chambers vs. chamber)
+    * utility function for pulling data from .doc files
+    * bugfix for pymongo 2.2
+
+1.1.0
+-----
+**23 April 2012**
     * large refactor of billy.site.{browse,www} into billy.web.{admin,public}
-    * expose internal id on bills (and all objects)
-    * add API method for direct lookup of bills by id
+    * require new scrapelib >= 0.7
+    * overhaul of event support, greatly improved schema
+    * scrape: improved vote validation
+    * API: expose internal id on all objects, including bills
+    * API: new method for direct lookup of bills by id
+    * API: added created_at sort to bills
     * add support for text extraction from bills
-    * improved vote validation during scrape
 
 1.0.0
 -----

@@ -2,9 +2,11 @@ import datetime
 import logging
 from collections import defaultdict
 
-from billy import db
+from billy.core import db
+from billy.core import settings
 from billy.utils import term_for_session
-from billy.reports.utils import update_common
+from billy.reports.utils import (update_common, get_quality_exceptions,
+                                 combine_reports)
 
 logger = logging.getLogger('billy')
 
@@ -24,36 +26,28 @@ def _bill_report_dict():
             'actions_per_month': defaultdict(int),
             'sponsorless_count': 0,
             '_sponsor_count': 0,
-            '_sponsors_with_leg_id_count': 0,
+            '_sponsors_with_id_count': 0,
             'sponsors_per_type': defaultdict(int),
-            'vote_count': 0,
-            '_passed_vote_count': 0,
-            'votes_per_month': defaultdict(int),
-            'votes_per_chamber': defaultdict(int),
-            'votes_per_type': defaultdict(int),
-            'bad_vote_counts': set(),
-            '_rollcall_count': 0,
-            '_rollcalls_with_leg_id_count': 0,
             '_subjects_count': 0,
             'bills_per_subject': defaultdict(int),
-            'sourceless_count': 0,
             'versionless_count': 0,
             'version_count': 0,
-            'unmatched_leg_ids': set(),
-           }
+            'unmatched_sponsors': set(),
+            'progress_meter_gaps': set(),
+            }
 
 
 def scan_bills(abbr):
-    metadata = db.metadata.find_one({'_id': abbr})
-    level = metadata['level']
-
     duplicate_sources = defaultdict(int)
     duplicate_versions = defaultdict(int)
     other_actions = defaultdict(int)
     uncategorized_subjects = defaultdict(int)
     sessions = defaultdict(_bill_report_dict)
 
-    for bill in db.bills.find({'level': level, level: abbr}):
+    # load exception data into sets of ids indexed by exception type
+    quality_exceptions = get_quality_exceptions(abbr)
+
+    for bill in db.bills.find({settings.LEVEL_FIELD: abbr}):
         session_d = sessions[bill['session']]
 
         # chamber count & bill_types
@@ -79,61 +73,33 @@ def scan_bills(abbr):
                 other_actions[action['action']] += 1
             session_d['actions_per_actor'][action['actor']] += 1
             session_d['actions_per_month'][date.strftime('%Y-%m')] += 1
+
+        # handle no_actions bills
         if not bill['actions']:
-            session_d['actionless_count'] += 1
+            if bill['_id'] not in quality_exceptions['bills:no_actions']:
+                session_d['actionless_count'] += 1
+            else:
+                quality_exceptions['bills:no_actions'].remove(bill['_id'])
 
         # sponsors
         for sponsor in bill['sponsors']:
             session_d['_sponsor_count'] += 1
-            if sponsor.get('leg_id'):
-                session_d['_sponsors_with_leg_id_count'] += 1
+            if sponsor.get('leg_id') or sponsor.get('committee_id'):
+                session_d['_sponsors_with_id_count'] += 1
             else:
-                # keep missing leg_ids
-                session_d['unmatched_leg_ids'].add(
+                # keep list of unmatched sponsors
+                session_d['unmatched_sponsors'].add(
                     (term_for_session(abbr, bill['session']), bill['chamber'],
-                    sponsor['name'])
+                     sponsor['name'])
                 )
             session_d['sponsors_per_type'][sponsor['type']] += 1
+
+        # handle no sponsors bills
         if not bill['sponsors']:
-            session_d['sponsorless_count'] += 1
-
-        # votes
-        for vote in bill['votes']:
-            session_d['vote_count'] += 1
-            if vote['passed']:
-                session_d['_passed_vote_count'] += 1
-            session_d['votes_per_chamber'][vote['chamber']] += 1
-            if not vote.get('type'):
-                logger.warning('vote is missing type on %s' % bill['_id'])
-                continue
-            session_d['votes_per_type'][vote.get('type')] += 1
-            if not vote.get('date'):
-                logger.warning('vote is missing date on %s' % bill['_id'])
-                continue
-            session_d['votes_per_month'][vote['date'].strftime('%Y-%m')] += 1
-
-            # roll calls
-            has_rollcalls = False
-            for rc in (vote['yes_votes'] + vote['no_votes'] +
-                       vote['other_votes']):
-                has_rollcalls = True
-                session_d['_rollcall_count'] += 1
-                if rc.get('leg_id'):
-                    session_d['_rollcalls_with_leg_id_count'] += 1
-                else:
-                    # keep missing leg_ids
-                    session_d['unmatched_leg_ids'].add(
-                        (term_for_session(abbr, bill['session']),
-                         vote['chamber'],
-                        rc['name'])
-                    )
-
-            # check counts if any rollcalls are present
-            if (has_rollcalls and
-                (len(vote['yes_votes']) != vote['yes_count'] or
-                 len(vote['no_votes']) != vote['no_count'] or
-                 len(vote['other_votes']) != vote['other_count'])):
-                session_d['bad_vote_counts'].add(bill['_id'])
+            if bill['_id'] not in quality_exceptions['bills:no_sponsors']:
+                session_d['sponsorless_count'] += 1
+            else:
+                quality_exceptions['bills:no_sponsors'].remove(bill['_id'])
 
         # subjects
         for subj in bill.get('scraped_subjects', []):
@@ -150,13 +116,41 @@ def scan_bills(abbr):
         # versions
         if not bill['versions']:
             # total num of bills w/o versions
-            session_d['versionless_count'] += 1
+            if bill['_id'] not in quality_exceptions['bills:no_versions']:
+                session_d['versionless_count'] += 1
+            else:
+                quality_exceptions['bills:no_versions'].remove(bill['_id'])
         else:
             # total num of versions
             session_d['version_count'] += len(bill['versions'])
         for doc in bill['versions']:
             duplicate_versions[doc['url']] += 1
-        # TODO: add a duplicate documents back in?
+        # TODO: add duplicate document detection back in?
+
+        # Check for progress meter gaps.
+        progress_meter_gaps = session_d['progress_meter_gaps']
+        action_dates = bill['action_dates']
+        bill_chamber = bill['chamber']
+        other_chamber = dict(lower='upper', upper='lower')[bill_chamber]
+
+        # Check for bills that were signed but didn't pass both chambers.
+        if bill['type'] == 'bill':
+            if action_dates['signed']:
+                if not action_dates['passed_upper']:
+                    progress_meter_gaps.add(bill['_id'])
+                elif not action_dates['passed_lower']:
+                    progress_meter_gaps.add(bill['_id'])
+
+        else:
+            # Check for nonbills that were signed but didn't pass their
+            # house of origin.
+            if action_dates['signed']:
+                if not action_dates['passed_' + bill_chamber]:
+                    progress_meter_gaps.add(bill['_id'])
+
+        if action_dates['passed_' + other_chamber]:
+            if not action_dates['passed_' + bill_chamber]:
+                progress_meter_gaps.add(bill['_id'])
 
     dup_version_urls = []
     dup_source_urls = []
@@ -167,34 +161,19 @@ def scan_bills(abbr):
         if n > 1:
             dup_source_urls.append(url)
 
+    # do logging of unnecessary exceptions
+    for qe_type, qes in quality_exceptions.iteritems():
+        if qes:
+            logger.warning('unnecessary {0} exceptions for {1} bills: \n  {2}'
+                           .format(qe_type, len(qes), '\n  '.join(qes)))
+
     return {'duplicate_versions': dup_version_urls,
             'duplicate_sources': dup_source_urls,
             'other_actions': other_actions.items(),
             'uncategorized_subjects': uncategorized_subjects.items(),
             'sessions': sessions,
+            'progress_meter_gaps': []
            }
-
-
-def combine_bill_reports(reports):
-    report = _bill_report_dict()
-
-    for session in reports.itervalues():
-        # go over all report fields
-        # integers are summed, sets are combined, and dicts summed by key
-        for field, value in report.iteritems():
-            if isinstance(value, int):
-                report[field] += session[field]
-            elif isinstance(value, set):
-                report[field].update(session[field])
-                session[field] = list(session[field])
-            elif isinstance(value, defaultdict):
-                for k, v in session[field].iteritems():
-                    report[field][k] += v
-
-    for field, value in report.iteritems():
-        if isinstance(value, set):
-            report[field] = list(value)
-    return report
 
 
 def calculate_percentages(report):
@@ -222,31 +201,16 @@ def calculate_percentages(report):
     # sponsors
     _sponsor_count = float(report.pop('_sponsor_count')) / 100
     if _sponsor_count:
-        report['sponsors_with_leg_id'] = (
-            report.pop('_sponsors_with_leg_id_count') / _sponsor_count)
+        report['sponsors_with_id'] = (
+            report.pop('_sponsors_with_id_count') / _sponsor_count)
         for k in report['sponsors_per_type'].iterkeys():
             report['sponsors_per_type'][k] /= _sponsor_count
-
-    # votes
-    vote_count = float(report['vote_count']) / 100
-    if vote_count:
-        report['votes_passed'] = report.pop('_passed_vote_count') / vote_count
-        for k in report['votes_per_type'].iterkeys():
-            report['votes_per_type'][k] /= vote_count
-        for k in report['votes_per_chamber'].iterkeys():
-            report['votes_per_chamber'][k] /= vote_count
-        for k in report['votes_per_month'].iterkeys():
-            report['votes_per_month'][k] /= vote_count
-    rollcall_count = float(report.pop('_rollcall_count')) / 100
-    if rollcall_count:
-        report['rollcalls_with_leg_id'] = (
-            report.pop('_rollcalls_with_leg_id_count') / rollcall_count
-        )
 
 
 def bill_report(abbr):
     report = scan_bills(abbr)
-    combined_report = combine_bill_reports(report['sessions'])
+    combined_report = combine_reports(report['sessions'],
+                                      _bill_report_dict())
     for session in report['sessions'].itervalues():
         calculate_percentages(session)
     calculate_percentages(combined_report)

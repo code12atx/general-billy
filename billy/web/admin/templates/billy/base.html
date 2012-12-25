@@ -1,14 +1,63 @@
+{% load staticfiles %}
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <title>{% block title %}{% endblock %} : billy admin</title>
-    <link rel="stylesheet" href="{{STATIC_URL}}css/bootstrap.min.css">
-    <script src="{{STATIC_URL}}scripts/jquery-1.7.1.min.js"></script>
-    <script src="{{STATIC_URL}}scripts/bootstrap-dropdown.js"></script>
+    <link rel="stylesheet" href="{% static "css/bootstrap.min.css" %}">
+    <script src="{% static "scripts/jquery-1.7.1.min.js" %}"></script>
+    <script src="{% static "scripts/bootstrap-dropdown.js" %}"></script>
     <script>
       $('.dropdown-toggle').dropdown();
     </script>
+    <style>
+        .good { background-color: #83D47A; }
+        .bad { background-color: #D47A7D; }
+        .entry {border-bottom: 1px solid #EEE; padding-top: 17px;}
+        .summary-attr {padding-right: 5px;}
+        .root-merge-fin { background-color: #abd6ba; }
+        .index-table tr:hover {color: black}
+        .index-table tr:hover > td.good { background-color: green; }
+        .index-table tr:hover > td.bad { background-color: red; }
+        .index-table  tr:hover > td.warning { background-color: yellow; }
+        .index-table  td.good { background-color: #b0ff66; }
+        .index-table  td.bad { background-color: #fc7c7d; }
+        .index-table  td.warning { background-color: #fcde7c; }
+        .hovertable tr:hover {cursor: pointer;}
+        /* collapse left margin */
+        .container-fluid { padding-left: 0px; }
+        .container-fluid > .content { margin-left: 10px; }
+        .merge-from-1 { background-color: #f2c58b; }
+        .merge-from-2 { background-color: #d1acc0; }
+        .merge-from-N { background-color: #abdb3b; }
+        /* to cut down ADD */
+        .dim          { opacity: .6; }
+        /* Style the flag drop-down menu.*/
+        img.flag {
+            height: 10px;
+            width: 15px;
+            padding-right: 10px;
+            padding-left: 0px;
+            padding-top: 0px;
+            padding-bottom: 0px;
+            border: 0;
+            clear: right;
+        }
+        #mainFilter .select2-container {
+            width: 200px;
+        }
+        #mainFilter li {
+            float: None;
+            margin-right: 0px;
+        }
+        .jqplot-table-legend { width:   auto; }
+        .jqplot-point-label { font-weight: bold; font-size:   0.8em; }
+        .error { background-color: #faf0a5; }
+        .success { background-color: #d6ff99; }
+        .bill-table th { text-align: center; } 
+        .bill-table td { text-align: right; }
+    </style>
+
     {% block script %}
     {% endblock %}
     {% block style %}
@@ -29,29 +78,30 @@
                     </a>
                     <ul class="dropdown-menu">
                     <li> <a href="{% url admin_bills metadata.abbreviation %}">Bill Overview</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}">Random Bill</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}?limit=bad_vote_counts">Bad Vote Counts</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}?limit=no_versions">Versionless</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}?limit=no_sponsors">Sponsorless</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}?limit=current_term">Current Term</a> </li>
-                    <li> <a href="{% url random_bill metadata.abbreviation %}?limit=no_actions">Actionless</a> </li>
+                    <li> <a href="{% url bad_vote_list metadata.abbreviation %}">Bad Vote Counts</a> </li>
+                    <li> <a href="{% url bill_list metadata.abbreviation %}?limit=no_versions">Versionless</a> </li>
+                    <li> <a href="{% url bill_list metadata.abbreviation %}?limit=no_sponsors">Sponsorless</a> </li>
+                    <li> <a href="{% url bill_list metadata.abbreviation %}?limit=no_actions">Actionless</a> </li>
+                    <li> <a href="{% url bill_list metadata.abbreviation %}">Current Session</a> </li>
+                    <li> <a href="{% url bill_list metadata.abbreviation %}?limit=current_term">Current Term</a> </li>
                     <li> <a href="{% url duplicate_versions metadata.abbreviation %}">Dup. Versions</a> </li>
+                    <li> <a href="{% url progress_meter_gaps metadata.abbreviation %}">Progress gaps</a> </li>
                     </ul>
                 </li>
                 <li> <a href='{% url admin_legislators metadata.abbreviation %}'>Legislators</a> </li>
                 <li> <a href='{% url admin_committees metadata.abbreviation %}'>Committees</a> </li>
                 <li class="dropdown">
                     <a href="#" class="dropdown-toggle"
-                        data-toggle="dropdown">Missing Data<b class="caret"></b>
+                        data-toggle="dropdown">Manual Data<b class="caret"></b>
                     </a>
                     <ul class="dropdown-menu">
-                    <li><a href="{% url uncategorized_subjects metadata.abbreviation %}">Subjects</a> </li>
-                    <li><a href="{% url unmatched_leg_ids metadata.abbreviation %}">Leg IDs</a> </li>
+                    <li><a href="{% url admin_matching metadata.abbreviation %}">Name Matching</a> </li>
+                    <li><a href="{% url admin_subjects metadata.abbreviation %}">Subjects</a> </li>
                     <li><a href="{% url other_actions metadata.abbreviation %}">Other Actions</a> </li>
-                    <li><a href="{% url district_stub metadata.abbreviation %}">District Stub</a> </li>
+                    <li><a href="{% url quality_exceptions metadata.abbreviation %}">Data Quality Exceptions</a> </li>
                     </ul>
                 </li>
-                <li> <a href="{% url state_run_detail metadata.abbreviation %}">Run Detail</a> </li>
+                <li> <a href="{% url run_detail_list metadata.abbreviation %}">Run Detail</a> </li>
                 {% endif %}
                 {% block menu %}{% endblock %}
             </ul>
@@ -60,12 +110,10 @@
     </div>
     {% block content-nocontainer %}
     <div class="container">
-        {% if warning %}
-            <div class="alert alert-block alert-error">
-                {% if warning_title %}
-                    <strong>{{ warning_title }}</strong><br />
-                {% endif %}
-                {{ warning }}
+        {% if alert %}
+            <div class="alert alert-block alert-{{alert.type}}">
+                <h4 class="alert-heading">{{alert.title}}</h4>
+                {{ alert.message }}
             </div>
         {% endif %}
         {% block content %}{% endblock %}

@@ -7,40 +7,21 @@ from collections import defaultdict
 
 from django.http import HttpResponse
 
-from billy import db
-from billy.conf import settings
-from billy.utils import keywordize, metadata, find_bill
+from billy.core import db
+from billy.models import Bill
+from billy.core import settings
+from billy.utils import find_bill, parse_param_dt
 
 import pymongo
 
 from piston.utils import rc
 from piston.handler import BaseHandler, HandlerMetaClass
 
-from jellyfish import levenshtein_distance
 
-_chamber_aliases = {
-    'assembly': 'lower',
-    'house': 'lower',
-    'senate': 'upper',
-}
-
-
-def parse_param_dt(dt):
-    formats = ['%Y-%m-%d %H:%M',    # here for legacy reasons
-               '%Y-%m-%dT%H:%M:%S',
-               '%Y-%m-%d']
-    for format in formats:
-        try:
-            return datetime.datetime.strptime(dt, format)
-        except ValueError:
-            pass
+_lower_fields = (settings.LEVEL_FIELD, 'chamber')
 
 
 def _build_mongo_filter(request, keys, icase=True):
-    # We use regex queries to get case insensitive search - this
-    # means they won't use any indexes for now. Real case insensitive
-    # queries are coming eventually:
-    # http://jira.mongodb.org/browse/SERVER-90
     _filter = {}
     keys = set(keys) - set(['fields'])
 
@@ -54,13 +35,16 @@ def _build_mongo_filter(request, keys, icase=True):
     for key in keys:
         value = request.GET.get(key)
         if value:
-            if key == 'chamber':
-                value = value.lower()
-                _filter[key] = _chamber_aliases.get(value, value)
+            if key in _lower_fields:
+                _filter[key] = value.lower()
             elif key.endswith('__in'):
                 values = value.split('|')
                 _filter[key[:-4]] = {'$in': values}
             else:
+                # We use regex queries to get case insensitive search - this
+                # means they won't use any indexes for now. Real case
+                # insensitive queries are coming eventually:
+                # http://jira.mongodb.org/browse/SERVER-90
                 _filter[key] = re.compile('^%s$' % value, re.IGNORECASE)
 
     return _filter
@@ -75,9 +59,14 @@ def _build_field_list(request, default_fields=None):
         return default_fields
     else:
         d = dict(zip(fields.split(','), itertools.repeat(1)))
-        d['_id'] = d.pop('id', 0)
+        d['_id'] = d.pop('id', 1)
         d['_type'] = 1
         return d
+
+
+def _get_vote_fields(fields):
+    return [field.replace('votes.', '', 1) for field in fields or [] if
+            field.startswith('votes.')] or None
 
 
 class BillyHandlerMetaClass(HandlerMetaClass):
@@ -121,21 +110,41 @@ class BillyHandler(BaseHandler):
     allowed_methods = ('GET',)
 
 
+def _metadata_backwards_shim(metadata):
+    if 'chambers' in metadata:
+        for chamber_type, chamber in metadata['chambers'].iteritems():
+            for field in ('name', 'title', 'term'):
+                if field in chamber:
+                    metadata[chamber_type + '_chamber_' + field] = \
+                        chamber[field]
+    return metadata
+
+
 class AllMetadataHandler(BillyHandler):
     def read(self, request):
-        data = db.metadata.find(fields={'level': 1, 'abbreviation': 1,
-                                        'name': 1, 'feature_flags': 1,
-                                        '_id': 0}).sort('name')
-        return list(data)
+        fields = _build_field_list(request, {'abbreviation': 1,
+                                             'name': 1,
+                                             'feature_flags': 1,
+                                             'chambers': 1,
+                                             '_id': 0
+                                            })
+        for f in fields.copy():
+            if '_chamber_' in f:
+                fields['chambers'] = 1
+        data = db.metadata.find(fields=fields).sort('name')
+        return [_metadata_backwards_shim(m) for m in data]
 
 
 class MetadataHandler(BillyHandler):
     def read(self, request, abbr):
-        """
-        Get metadata about a legislature.
-        """
-        return db.metadata.find_one({'_id': abbr.lower()},
-                                    fields=_build_field_list(request))
+        field_list = _build_field_list(request)
+        if field_list:
+            for f in field_list.copy():
+                if '_chamber_' in f:
+                    field_list['chambers'] = 1
+        return _metadata_backwards_shim(
+            db.metadata.find_one({'_id': abbr.lower()}, fields=field_list)
+        )
 
 
 class BillHandler(BillyHandler):
@@ -145,85 +154,103 @@ class BillHandler(BillyHandler):
             query = {'_id': billy_bill_id}
         else:
             abbr = abbr.lower()
-            level = metadata(abbr)['level']
-            query = {level: abbr, 'session': session, 'bill_id': bill_id}
+            query = {settings.LEVEL_FIELD: abbr, 'session': session,
+                     'bill_id': bill_id}
             if chamber:
                 query['chamber'] = chamber.lower()
-        return find_bill(query, fields=_build_field_list(request))
+        fields = _build_field_list(request)
+        bill = find_bill(query, fields=fields)
+        vote_fields = _get_vote_fields(fields)
+        # include votes if no fields are specified, if it is specified, or
+        # if subfields are specified
+        if not fields or 'votes' in fields or vote_fields:
+            bill['votes'] = list(db.votes.find({'bill_id': bill['_id']},
+                                               fields=vote_fields))
+        return bill
 
 
 class BillSearchHandler(BillyHandler):
     def read(self, request):
 
         bill_fields = {'title': 1, 'created_at': 1, 'updated_at': 1,
-                       'bill_id': 1, 'type': 1, 'state': 1, 'level': 1,
-                       'country': 1, 'session': 1, 'chamber': 1, 'subjects': 1,
-                       '_type': 1, 'id': 1}
+                       'bill_id': 1, 'type': 1, settings.LEVEL_FIELD: 1,
+                       'session': 1, 'chamber': 1, 'subjects': 1, '_type': 1,
+                       'id': 1}
         # replace with request's fields if they exist
         bill_fields = _build_field_list(request, bill_fields)
 
         # normal mongo search logic
-        _filter = _build_mongo_filter(request, ('state', 'chamber',
-                                                'subjects', 'bill_id',
-                                                'bill_id__in'))
+        base_fields = _build_mongo_filter(request, ('chamber', 'subjects',
+                                                    'bill_id', 'bill_id__in'))
 
-        # process full-text query
+        # process extra attributes
         query = request.GET.get('q')
-        if query:
-            keywords = list(keywordize(query))
-            _filter['_keywords'] = {'$all': keywords}
-
-        # process search_window
-        search_window = request.GET.get('search_window', '')
-        if search_window:
-            if search_window == 'session':
-                _filter['_current_session'] = True
-            elif search_window == 'term':
-                _filter['_current_term'] = True
-            elif search_window.startswith('session:'):
-                _filter['session'] = search_window.split('session:')[1]
-            elif search_window.startswith('term:'):
-                _filter['_term'] = search_window.split('term:')[1]
-            elif search_window == 'all':
-                pass
-            else:
-                resp = rc.BAD_REQUEST
-                resp.write(": invalid search_window. Valid choices are "
-                           "'term', 'session' or 'all'")
-                return resp
-
-        # process updated_since
-        since = request.GET.get('updated_since')
-        if since:
-            try:
-                _filter['updated_at'] = {'$gte': parse_param_dt(since)}
-            except ValueError:
-                resp = rc.BAD_REQUEST
-                resp.write(": invalid updated_since parameter."
-                           " Please supply a date in YYYY-MM-DD format.")
-                return resp
-
-        # process sponsor_id
+        abbr = request.GET.get(settings.LEVEL_FIELD)
+        if abbr:
+            abbr = abbr.lower()
+        search_window = request.GET.get('search_window', 'all')
+        since = request.GET.get('updated_since', None)
         sponsor_id = request.GET.get('sponsor_id')
-        if sponsor_id:
-            _filter['sponsors.leg_id'] = sponsor_id
 
-        # limit response size
-        count = db.bills.find(_filter, bill_fields).count()
-        if count > 5000:
+        try:
+            query = Bill.search(query,
+                                abbr=abbr,
+                                search_window=search_window,
+                                updated_since=since, sponsor_id=sponsor_id,
+                                bill_fields=bill_fields,
+                                **base_fields)
+        except ValueError as e:
             resp = rc.BAD_REQUEST
-            resp.write(': request too large, try narrowing your search by '
-                       'adding more filters.')
+            resp.write(': %s' % e)
             return resp
 
-        query = db.bills.find(_filter, bill_fields)
+        # add pagination
+        page = request.GET.get('page')
+        per_page = request.GET.get('per_page')
+        if page and not per_page:
+            per_page = 50
+        if per_page and not page:
+            page = 1
+
+        if page:
+            page = int(page)
+            per_page = int(per_page)
+            query = query.limit(per_page).skip(per_page * (page - 1))
+        else:
+            # limit response size
+            if query.count() > 10000:
+                resp = rc.BAD_REQUEST
+                resp.write(': request too large, try narrowing your search by '
+                           'adding more filters.')
+                return resp
 
         # sorting
         sort = request.GET.get('sort')
         if sort == 'updated_at':
             query = query.sort([('updated_at', -1)])
+        elif sort == 'created_at':
+            query = query.sort([('created_at', -1)])
+        elif sort == 'last_action':
+            query = query.sort([('action_dates.last', -1)])
 
-        return list(query)
+        # attach votes if necessary
+        bills = list(query)
+        bill_ids = [bill['_id'] for bill in bills]
+        vote_fields = _get_vote_fields(bill_fields)
+        if 'votes' in bill_fields or vote_fields:
+            # add bill_id to vote_fields for relating back
+            votes = list(db.votes.find({'bill_id': {'$in': bill_ids}},
+                                       fields=vote_fields + ['bill_id']))
+            votes_by_bill = defaultdict(list)
+            for vote in votes:
+                votes_by_bill[vote['bill_id']].append(vote)
+                # remove bill_id unless they really requested it
+                if 'bill_id' not in vote_fields:
+                    vote.pop('bill_id')
+            for bill in bills:
+                bill['votes'] = votes_by_bill[bill['_id']]
+
+        return bills
 
 
 class LegislatorHandler(BillyHandler):
@@ -238,8 +265,8 @@ class LegislatorSearchHandler(BillyHandler):
         # replace with request's fields if they exist
         legislator_fields = _build_field_list(request, legislator_fields)
 
-        _filter = _build_mongo_filter(request, ('state', 'first_name',
-                                                'last_name'))
+        _filter = _build_mongo_filter(request, (settings.LEVEL_FIELD,
+                                                'first_name', 'last_name'))
         elemMatch = _build_mongo_filter(request, ('chamber', 'term',
                                                   'district', 'party'))
         if elemMatch:
@@ -269,7 +296,8 @@ class CommitteeSearchHandler(BillyHandler):
         committee_fields = _build_field_list(request, committee_fields)
 
         _filter = _build_mongo_filter(request, ('committee', 'subcommittee',
-                                                'chamber', 'state'))
+                                                'chamber',
+                                                settings.LEVEL_FIELD))
         return list(db.committees.find(_filter, committee_fields))
 
 
@@ -283,7 +311,7 @@ class EventsHandler(BillyHandler):
 
         spec = {}
 
-        for key in ('state', 'type'):
+        for key in (settings.LEVEL_FIELD, 'type'):
             value = request.GET.get(key)
             if not value:
                 continue
@@ -320,20 +348,19 @@ class EventsHandler(BillyHandler):
                        " Please supply a date in YYYY-MM-DD format.")
             return resp
 
-        return list(db.events.find(spec).sort(
-            'when', pymongo.ASCENDING).limit(1000))
+        return list(db.events.find(spec, fields=_build_field_list(request)
+                                  ).sort('when', pymongo.ASCENDING).limit(1000)
+                   )
 
 
 class SubjectListHandler(BillyHandler):
     def read(self, request, abbr, session=None, chamber=None):
         abbr = abbr.lower()
-        level = metadata(abbr)['level']
-        spec = {level: abbr}
+        spec = {settings.LEVEL_FIELD: abbr}
         if session:
             spec['session'] = session
         if chamber:
-            chamber = chamber.lower()
-            spec['chamber'] = _chamber_aliases.get(chamber, chamber)
+            spec['chamber'] = chamber.lower()
         result = {}
         for subject in settings.BILLY_SUBJECTS:
             count = db.bills.find(dict(spec, subjects=subject)).count()
@@ -341,117 +368,8 @@ class SubjectListHandler(BillyHandler):
         return result
 
 
-class ReconciliationHandler(BaseHandler):
-    """
-    An endpoint compatible with the Google Refine 2.0 reconciliation API.
-
-    Given a query containing a legislator name along with some optional
-    filtering properties ("state", "chamber"), this handler will return
-    a list of possible matching legislators.
-
-    See http://code.google.com/p/google-refine/wiki/ReconciliationServiceApi
-    for the API specification.
-    """
-    allowed_methods = ('GET', 'POST')
-    key = getattr(settings, 'SUNLIGHT_SERVICES_KEY', 'no-key')
-
-    metadata = {
-        "name": "Billy Reconciliation Service",
-        "view": {
-            "url": "%slegislators/preview/{{id}}/?apikey=%s" % (
-                settings.API_BASE_URL, key),
-            },
-        "preview": {
-            "url": "%slegislators/preview/{{id}}/?apikey=%s" % (
-                settings.API_BASE_URL, key),
-            "width": 430,
-            "height": 300
-            },
-        "defaultTypes": [
-            {"id": "/billy/legislator",
-             "name": "Legislator"}],
-        }
-
-    def read(self, request):
-        return self.reconcile(request)
-
-    def create(self, request):
-        return self.reconcile(request)
-
-    def reconcile(self, request):
-        query = request.GET.get('query') or request.POST.get('query')
-
-        if query:
-            # If the query doesn't start with a '{' then it's a simple
-            # string that should be used as the query w/ no extra params
-            if not query.startswith("{"):
-                query = '{"query": "%s"}' % query
-            query = json.loads(query)
-
-            return {"result": self.results(query)}
-
-        # Batch query mode
-        queries = request.GET.get('queries') or request.POST.get('queries')
-
-        if queries:
-            queries = json.loads(queries)
-            ret = {}
-            for key, value in queries.items():
-                ret[key] = {'result': self.results(value)}
-
-            return ret
-
-        # If no queries, return metadata
-        return self.metadata
-
-    def results(self, query):
-        # Look for the query to be a substring of a legislator name
-        # (case-insensitive)
-        pattern = re.compile(".*%s.*" % query['query'],
-                             re.IGNORECASE)
-
-        spec = {'full_name': pattern}
-
-        for prop in query.get('properties', []):
-            # Allow filtering by state or chamber for now
-            if prop['pid'] in ('state', 'chamber'):
-                spec[prop['pid']] = prop['v']
-
-        legislators = db.legislators.find(spec)
-
-        results = []
-        for leg in legislators:
-            if legislators.count() == 1:
-                match = True
-                score = 100
-            else:
-                match = False
-                if leg['last_name'] == query['query']:
-                    score = 90
-                else:
-                    distance = levenshtein_distance(leg['full_name'].lower(),
-                                                    query['query'].lower())
-                    score = 100.0 / (1 + distance)
-
-            # Note: There's a bug in Refine that causes reconciliation
-            # scores to be overwritten if the same legislator is returned
-            # for multiple queries. see:
-            # http://code.google.com/p/google-refine/issues/detail?id=185
-
-            results.append({"id": leg['_id'],
-                            "name": leg['full_name'],
-                            "score": score,
-                            "match": match,
-                            "type": [
-                                {"id": "/billy/legislator",
-                                 "name": "Legislator"}]})
-
-        return sorted(results, cmp=lambda l, r: cmp(r['score'], l['score']))
-
-
 class LegislatorGeoHandler(BillyHandler):
-    base_url = getattr(settings, 'BOUNDARY_SERVICE_URL',
-                       'http://localhost:8001/1.0/')
+    base_url = settings.BOUNDARY_SERVICE_URL
 
     def read(self, request):
         latitude, longitude = request.GET.get('lat'), request.GET.get('long')
@@ -461,8 +379,9 @@ class LegislatorGeoHandler(BillyHandler):
             resp.write(': Need lat and long parameters')
             return resp
 
-        url = "%sboundary/?shape_type=none&contains=%s,%s&sets=sldl,sldu&limit=0" % (
-            self.base_url, latitude, longitude)
+        url = "%sboundaries/?contains=%s,%s&sets=%s&limit=0" % (
+            self.base_url, latitude, longitude, settings.BOUNDARY_SERVICE_SETS
+        )
 
         resp = json.load(urllib2.urlopen(url))
 
@@ -470,28 +389,31 @@ class LegislatorGeoHandler(BillyHandler):
         boundary_mapping = {}
 
         for dist in resp['objects']:
-            state = dist['name'][0:2].lower()
-            chamber = {'/1.0/boundary-set/sldu/': 'upper',
-                       '/1.0/boundary-set/sldl/': 'lower'}[dist['set']]
-            census_name = dist['slug']
-
             # look up district slug
-            districts = db.districts.find({'chamber': chamber,
-                                           'boundary_id': census_name})
+            boundary_id = dist['url'].replace('/boundaries/', '').strip('/')
+            districts = db.districts.find({'boundary_id': boundary_id})
             count = districts.count()
-            if count:
-                filters.append({'state': state,
-                                'district': districts[0]['name'],
-                                'chamber': chamber})
-                boundary_mapping[(state, districts[0]['name'], chamber)] = census_name
+            if count == 1:
+                filters.append({'district': districts[0]['name'],
+                                'chamber': districts[0]['chamber'],
+                                settings.LEVEL_FIELD: districts[0]['abbr'],
+                               })
+                boundary_mapping[(districts[0]['abbr'],
+                                  districts[0]['name'],
+                                  districts[0]['chamber'])] = boundary_id
+            elif count != 0:
+                raise ValueError('multiple districts with boundary_id: %s' %
+                                 boundary_id)
 
         if not filters:
             return []
 
-        legislators = list(db.legislators.find({'$or': filters},
-                                               _build_field_list(request)))
+        fields = _build_field_list(request)
+        if fields is not None:
+            fields['state'] = fields['district'] = fields['chamber'] = 1
+        legislators = list(db.legislators.find({'$or': filters}, fields))
         for leg in legislators:
-            leg['boundary_id'] = boundary_mapping[(leg['state'],
+            leg['boundary_id'] = boundary_mapping[(leg[settings.LEVEL_FIELD],
                                                    leg['district'],
                                                    leg['chamber'])]
         return legislators
@@ -507,7 +429,7 @@ class DistrictHandler(BillyHandler):
         districts = list(db.districts.find(filter))
 
         # change leg filter
-        filter['state'] = filter.pop('abbr')
+        filter[settings.LEVEL_FIELD] = filter.pop('abbr')
         filter['active'] = True
         legislators = db.legislators.find(filter, fields={'_id': 0,
                                                           'leg_id': 1,
@@ -527,37 +449,46 @@ class DistrictHandler(BillyHandler):
 
 
 class BoundaryHandler(BillyHandler):
-    base_url = getattr(settings, 'BOUNDARY_SERVICE_URL',
-                       'http://localhost:8001/1.0/')
+    base_url = settings.BOUNDARY_SERVICE_URL
 
     def read(self, request, boundary_id):
-        url = "%sboundary/%s/?shape_type=simple" % (self.base_url, boundary_id)
+        url = "%sboundaries/%s/simple_shape" % (self.base_url, boundary_id)
         try:
             data = json.load(urllib2.urlopen(url))
-        except urllib2.HTTPError, e:
-            if 400 <= e.code < 500:
+        except urllib2.HTTPError as e:
+            if e.code >= 400:
                 resp = rc.NOT_FOUND
                 return resp
             else:
                 raise e
 
-        centroid = data['centroid']['coordinates']
-
         all_lon = []
         all_lat = []
-        for shape in data['simple_shape']['coordinates']:
+        for shape in data['coordinates']:
             for coord_set in shape:
                 all_lon.extend(c[0] for c in coord_set)
                 all_lat.extend(c[1] for c in coord_set)
-        lon_delta = abs(max(all_lon) - min(all_lon))
-        lat_delta = abs(max(all_lat) - min(all_lat))
 
-        region = {'center_lon': centroid[0], 'center_lat': centroid[1],
+        min_lat = min(all_lat)
+        min_lon = min(all_lon)
+        max_lat = max(all_lat)
+        max_lon = max(all_lon)
+
+        lon_delta = abs(max_lon - min_lon)
+        lat_delta = abs(max_lat - min_lat)
+
+        region = {'center_lon': (max_lon + min_lon) / 2,
+                  'center_lat': (max_lat + min_lat) / 2,
                   'lon_delta': lon_delta, 'lat_delta': lat_delta,
                  }
+        bbox = [[min_lat, min_lon], [max_lat, max_lon]]
 
         district = db.districts.find_one({'boundary_id': boundary_id})
-        district['shape'] = data['simple_shape']['coordinates']
+        if not district:
+            resp = rc.NOT_FOUND
+            return resp
+        district['shape'] = data['coordinates']
         district['region'] = region
+        district['bbox'] = bbox
 
         return district

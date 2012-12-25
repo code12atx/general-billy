@@ -2,20 +2,15 @@ import os
 import re
 import time
 import json
+import copy
 import datetime
 
-from pymongo.son import SON
+from bson.son import SON
 import pymongo.errors
 import name_tools
 
-from billy import db
-
-oyster_import_exception = None
-try:
-    from oyster.core import kernel
-except Exception as e:
-    kernel = None
-    oyster_import_exception = e
+from billy.core import db, settings
+from billy.importers.names import attempt_committee_match
 
 
 def _get_property_dict(schema):
@@ -25,11 +20,14 @@ def _get_property_dict(schema):
         pdict[k] = {}
         if 'items' in v and 'properties' in v['items']:
             pdict[k] = _get_property_dict(v['items'])
+    pdict[settings.LEVEL_FIELD] = {}
     return pdict
+
 
 # load standard fields from schema files
 standard_fields = {}
-for _type in ('bill', 'person', 'committee', 'metadata', 'vote', 'event'):
+for _type in ('bill', 'person', 'committee', 'metadata', 'vote',
+              'event', 'speech'):
     fname = os.path.join(os.path.split(__file__)[0],
                          '../schemas/%s.json' % _type)
     schema = json.load(open(fname))
@@ -60,16 +58,17 @@ def insert_with_id(obj):
     else:
         raise ValueError("unknown _type for object")
 
-    level = obj[obj['level']].upper()
+    # get abbr
+    abbr = obj[settings.LEVEL_FIELD].upper()
 
-    id_reg = re.compile('^%s%s' % (level, id_type))
+    id_reg = re.compile('^%s%s' % (abbr, id_type))
 
     # Find the next available _id and insert
-    id_prefix = '%s%s' % (level, id_type)
+    id_prefix = '%s%s' % (abbr, id_type)
     cursor = collection.find({'_id': id_reg}).sort('_id', -1).limit(1)
 
     try:
-        new_id = int(cursor.next()['_id'][3:]) + 1
+        new_id = int(cursor.next()['_id'][len(abbr) + 1:]) + 1
     except StopIteration:
         new_id = 1
 
@@ -88,6 +87,7 @@ def insert_with_id(obj):
         except pymongo.errors.DuplicateKeyError:
             new_id += 1
 
+
 def _timestamp_to_dt(timestamp):
     tstruct = time.localtime(timestamp)
     dt = datetime.datetime(*tstruct[0:6])
@@ -99,6 +99,7 @@ def _timestamp_to_dt(timestamp):
 def compare_committee(ctty1, ctty2):
     def _cleanup(obj):
         ctty_junk_words = [
+            "(\s+|^)standing(\s+|$)",
             "(\s+|^)committee(\s+|$)",
             "(\s+|^)on(\s+|$)",
             "(\s+|^)joint(\s+|$)",
@@ -110,10 +111,20 @@ def compare_committee(ctty1, ctty2):
         for junk in ctty_junk_words:
             obj = re.sub(junk, " ", obj).strip()
         obj = re.sub("\s+", " ", obj)
+        obj = re.sub(r'\s+', ' ', re.sub(r'\W+', ' ', obj)).strip()
         return obj
-    ctty1 = _cleanup(ctty1)
-    ctty2 = _cleanup(ctty2)
-    return ctty1 == ctty2
+    check_both = [
+        ("", ""),
+        ("&", "and")
+    ]
+    for old, new in check_both:
+        c1 = ctty1.replace(old, new)
+        c2 = ctty2.replace(old, new)
+        c1 = _cleanup(c1)
+        c2 = _cleanup(c2)
+        if c1 == c2:
+            return True
+    return False
 
 
 def update(old, new, collection, sneaky_update_filter=None):
@@ -132,10 +143,6 @@ def update(old, new, collection, sneaky_update_filter=None):
             format is a dict mapping field names to a comparison function
             that returns True iff there is a change
     """
-    # To prevent deleting standalone votes..
-    if 'votes' in new and not new['votes']:
-        del new['votes']
-
     # need_save = something has changed
     need_save = False
 
@@ -180,18 +187,9 @@ def convert_timestamps(obj):
             except TypeError:
                 raise TypeError("expected float for %s, got %s" % (key, value))
 
-    for key in ('sources', 'actions', 'votes'):
+    for key in ('sources', 'actions', 'votes', 'roles'):
         for child in obj.get(key, []):
             convert_timestamps(child)
-
-    for term in obj.get('terms', []):
-        convert_timestamps(term)
-
-    for details in obj.get('session_details', {}).values():
-        convert_timestamps(details)
-
-    for role in obj.get('roles', []):
-        convert_timestamps(role)
 
     return obj
 
@@ -271,14 +269,15 @@ def merge_legislators(leg1, leg2):
     if leg1['_id'] > leg2['_id']:
         leg1, leg2 = leg2, leg1
 
-    leg1 = leg1.copy()
-    leg2 = leg2.copy()
+    # use deep copy for roles
+    leg1 = copy.deepcopy(leg1)
+    leg2 = copy.deepcopy(leg2)
 
     roles = 'roles'
     old_roles = 'old_roles'
 
-    no_compare = set(('_id', 'leg_id', '_all_ids', '_locked_fields',
-        'created_at', 'updated_at', roles, old_roles))
+    no_compare = {'_id', 'leg_id', '_all_ids', '_locked_fields', 'created_at',
+                  'updated_at', roles, old_roles}
 
     leg1['_all_ids'] += leg2['_all_ids']
 
@@ -313,23 +312,84 @@ def merge_legislators(leg1, leg2):
         #      old_roles & roles!! There's a potenital for data loss, but it's
         #      not that big of a thing.
         #   -- paultag & jamesturk, 02-02-2012
-        crole = leg1[roles][0]
-        try:
-            leg1[old_roles][crole['term']].append(crole)
-        except KeyError:
+        if len(leg1[roles]) > 0:
+            crole = leg1[roles][0]
             try:
-                leg1[old_roles][crole['term']] = [crole]
+                leg1[old_roles][crole['term']].append(crole)
             except KeyError:
-                # dear holy god this needs to be fixed.
-                leg1[old_roles] = {crole['term']: [crole]}
+                try:
+                    leg1[old_roles][crole['term']] = [crole]
+                except KeyError:
+                    # dear holy god this needs to be fixed.
+                    leg1[old_roles] = {crole['term']: [crole]}
 
-        # OK. We've migrated the newly old roles to the old_roles entry.
-        leg1[roles] = [leg2[roles][0]]
+        if len(leg2[roles]) > 0:
+            # OK. We've migrated the newly old roles to the old_roles entry.
+            leg1[roles] = [leg2[roles][0]]
+
+    # copy over old_roles from other terms
+    for term in leg2.get('old_roles', {}):
+        if term not in leg1['old_roles']:
+            leg1['old_roles'][term] = leg2['old_roles'][term]
+
     return (leg1, leg2['_id'])
 
+__committee_ids = {}
 
-def oysterize(url, doc_class, id, **kwargs):
-    if not kernel:
-        raise oyster_import_exception
-    # kwargs pass through as metadata
-    kernel.track_url(url, doc_class, id=id, **kwargs)
+
+def get_committee_id(abbr, chamber, committee):
+
+    manual = attempt_committee_match(abbr,
+                                     chamber,
+                                     committee)
+
+    if manual:
+        return manual
+
+    key = (abbr, chamber, committee)
+    if key in __committee_ids:
+        return __committee_ids[key]
+
+    spec = {settings.LEVEL_FIELD: abbr, 'chamber': chamber,
+            'committee': committee, 'subcommittee': None}
+
+    comms = db.committees.find(spec)
+
+    if comms.count() != 1:
+        flag = 'Committee on'
+        if flag not in committee:
+            spec['committee'] = 'Committee on ' + committee
+        else:
+            spec['committee'] = committee.replace(flag, "").strip()
+        comms = db.committees.find(spec)
+
+    if comms and comms.count() == 1:
+        __committee_ids[key] = comms[0]['_id']
+    else:
+        # last resort :(
+        comm_id = get_committee_id_alt(abbr, committee, chamber)
+        __committee_ids[key] = comm_id
+
+    return __committee_ids[key]
+
+
+def get_committee_id_alt(abbr, name, chamber):
+    matched_committee = None
+    spec = {settings.LEVEL_FIELD: abbr, "chamber": chamber}
+    if chamber is None:
+        del(spec['chamber'])
+    comms = db.committees.find(spec)
+    for committee in comms:
+        c = committee['committee']
+        if committee['subcommittee'] is not None:
+            c += " %s" % (committee['subcommittee'])
+
+        if compare_committee(name, c):
+            if not matched_committee is None:
+                return None  # In the event we match more then one committee.
+            matched_committee = committee['_id']
+
+    if matched_committee is None and not chamber is None:
+        matched_committee = get_committee_id_alt(abbr, name, None)
+
+    return matched_committee

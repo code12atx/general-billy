@@ -14,3 +14,7 @@ MANIFEST
 *.class
 *.jar
 build
+.tox
+.coverage
+billy/tests/cover
+coverage.sh

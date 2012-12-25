@@ -1,18 +1,21 @@
+import datetime as dt
 from nose.tools import with_setup
 
-from billy import db
+from billy.core import db
 from billy.importers import events
+from .. import fixtures
 
 
 def setup_func():
     db.events.drop()
     db.event_ids.drop()
+    fixtures.load_metadata()
 
 
 @with_setup(setup_func)
 def test_import_event_guid():
-    event = {'level': 'state', 'state': 'ex', 'description': 'TBD',
-             'when': 'now', 'end': 'never', 'type': 'party',
+    event = {'state': 'ex', 'description': 'TBD',
+             'when': dt.datetime.now(), 'end': 'never', 'type': 'party',
              '_guid': 'xx-yy-zz'}
 
     # test insert
@@ -32,8 +35,8 @@ def test_import_event_guid():
 
 @with_setup(setup_func)
 def test_import_event_no_guid():
-    event = {'level': 'state', 'state': 'ex', 'description': 'TBD',
-             'when': 'now', 'end': 'never', 'type': 'party'}
+    event = {'state': 'ex', 'description': 'TBD',
+             'when': dt.datetime.now(), 'end': 'never', 'type': 'party'}
 
     # test insert
     events.import_event(event)

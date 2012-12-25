@@ -1,12 +1,12 @@
 import os
-import time
 import logging
-import datetime
+import importlib
 import json
 
 from billy.scrape.validator import DatetimeValidator
 
-from billy.conf import settings
+from billy.core import settings
+from billy.utils import JSONEncoderPlus
 
 import scrapelib
 
@@ -22,7 +22,7 @@ class ScrapeError(Exception):
     def __str__(self):
         if self.orig_exception:
             return '%s\nOriginal Exception: %s' % (self.msg,
-                                        self.orig_exception)
+                                                   self.orig_exception)
         else:
             return self.msg
 
@@ -38,18 +38,6 @@ class NoDataForPeriod(ScrapeError):
         return 'No data exists for %s' % self.period
 
 
-class JSONDateEncoder(json.JSONEncoder):
-    """
-    JSONEncoder that encodes datetime objects as Unix timestamps.
-    """
-    def default(self, obj):
-        if isinstance(obj, datetime.datetime):
-            return time.mktime(obj.utctimetuple())
-        elif isinstance(obj, datetime.date):
-            return time.mktime(obj.timetuple())
-
-        return json.JSONEncoder.default(self, obj)
-
 # maps scraper_type -> scraper
 _scraper_registry = dict()
 
@@ -60,15 +48,10 @@ class ScraperMeta(type):
     def __new__(meta, classname, bases, classdict):
         cls = type.__new__(meta, classname, bases, classdict)
 
-        # default level to state to preserve old behavior
-        if not hasattr(cls, 'level'):
-            cls.level = 'state'
-            cls.country = 'us'
-
-        region = getattr(cls, cls.level, None)
+        abbr = getattr(cls, 'jurisdiction', None)
         scraper_type = getattr(cls, 'scraper_type', None)
 
-        if region and scraper_type:
+        if abbr and scraper_type:
             _scraper_registry[scraper_type] = cls
 
         return cls
@@ -85,75 +68,85 @@ class Scraper(scrapelib.Scraper):
 
     latest_only = False
 
-    def __init__(self, metadata, no_cache=False, output_dir=None,
-                 strict_validation=None, **kwargs):
+    def __init__(self, metadata, output_dir=None, strict_validation=None,
+                 fastmode=False, **kwargs):
         """
         Create a new Scraper instance.
 
         :param metadata: metadata for this scraper
-        :param no_cache: if True, will ignore any cached downloads
         :param output_dir: the data directory to use
         :param strict_validation: exit immediately if validation fails
         """
 
         # configure underlying scrapelib object
-        if no_cache:
-            kwargs['cache_dir'] = None
-        elif 'cache_dir' not in kwargs:
-            kwargs['cache_dir'] = settings.BILLY_CACHE_DIR
+        kwargs['cache_obj'] = scrapelib.FileCache(settings.BILLY_CACHE_DIR)
+        kwargs['requests_per_minute'] = settings.SCRAPELIB_RPM
+        kwargs['timeout'] = settings.SCRAPELIB_TIMEOUT
+        kwargs['retry_attempts'] = settings.SCRAPELIB_RETRY_ATTEMPTS
+        kwargs['retry_wait_seconds'] = settings.SCRAPELIB_RETRY_WAIT_SECONDS
 
-        if 'error_dir' not in kwargs:
-            kwargs['error_dir'] = settings.BILLY_ERROR_DIR
-
-        if 'timeout' not in kwargs:
-            kwargs['timeout'] = settings.SCRAPELIB_TIMEOUT
-
-        if 'requests_per_minute' not in kwargs:
-            kwargs['requests_per_minute'] = None
-
-        if 'retry_attempts' not in kwargs:
-            kwargs['retry_attempts'] = settings.SCRAPELIB_RETRY_ATTEMPTS
-
-        if 'retry_wait_seconds' not in kwargs:
-            kwargs['retry_wait_seconds'] = \
-                    settings.SCRAPELIB_RETRY_WAIT_SECONDS
+        if fastmode:
+            kwargs['requests_per_minute'] = 0
+            kwargs['cache_write_only'] = False
 
         super(Scraper, self).__init__(**kwargs)
 
-        for f in settings.BILLY_LEVEL_FIELDS[self.level]:
-            if not hasattr(self, f):
-                raise Exception('%s scrapers must have a %s attribute' % (
-                    self.level, f))
-
         self.metadata = metadata
         self.output_dir = output_dir
+        self.output_names = set()
 
-        # make output dir, error dir, and cache dir
-        for d in (self.output_dir, kwargs['cache_dir'], kwargs['error_dir']):
-            try:
-                if d:
-                    os.makedirs(d)
-            except OSError as e:
-                if e.errno != 17:
-                    raise e
+        # make output_dir
+        os.path.isdir(self.output_dir) or os.path.makedirs(self.output_dir)
 
         # validation
         self.strict_validation = strict_validation
         self.validator = DatetimeValidator()
+        self._schema = {}
+        self._load_schemas()
 
         self.follow_robots = False
 
         # logging convenience methods
         self.logger = logging.getLogger("billy")
         self.log = self.logger.info
+        self.info = self.logger.info
         self.debug = self.logger.debug
         self.warning = self.logger.warning
+        self.error = self.logger.error
+        self.critical = self.logger.critical
+
+    def _load_schemas(self):
+        """ load all schemas into schema dict """
+
+        types = ('bill', 'committee', 'person', 'vote', 'event', 'speech')
+
+        for type in types:
+            schema_path = os.path.join(os.path.split(__file__)[0],
+                                       '../schemas/%s.json' % type)
+            self._schema[type] = json.load(open(schema_path))
+            self._schema[type]['properties'][settings.LEVEL_FIELD] = {
+                'minLength': 2, 'type': 'string'}
+
+        # bills & votes
+        self._schema['bill']['properties']['session']['enum'] = \
+            self.all_sessions()
+        self._schema['vote']['properties']['session']['enum'] = \
+            self.all_sessions()
+
+        # legislators
+        terms = [t['name'] for t in self.metadata['terms']]
+        # ugly break here b/c this line is nearly impossible to split
+        self._schema['person']['properties']['roles'][
+            'items']['properties']['term']['enum'] = terms
+
+    @property
+    def object_count(self):
+        # number of distinct output filenames
+        return len(self.output_names)
 
     def validate_json(self, obj):
-        if not hasattr(self, '_schema'):
-            self._schema = self._get_schema()
         try:
-            self.validator.validate(obj, self._schema)
+            self.validator.validate(obj, self._schema[obj['_type']])
         except ValueError as ve:
             self.warning(str(ve))
             if self.strict_validation:
@@ -165,13 +158,17 @@ class Scraper(scrapelib.Scraper):
             sessions.extend(t['sessions'])
         return sessions
 
-    def validate_session(self, session):
+    def validate_session(self, session, latest_only=False):
         """ Check that a session is present in the metadata dictionary.
 
         raises :exc:`~billy.scrape.NoDataForPeriod` if session is invalid
 
         :param session:  string representing session to check
         """
+        if latest_only:
+            if session != self.metadata['terms'][-1]['sessions'][-1]:
+                raise NoDataForPeriod(session)
+
         for t in self.metadata['terms']:
             if session in t['sessions']:
                 return True
@@ -199,15 +196,25 @@ class Scraper(scrapelib.Scraper):
         raise NoDataForPeriod(term)
 
     def save_object(self, obj):
-        # copy over level information
-        obj['level'] = self.level
-        for f in settings.BILLY_LEVEL_FIELDS[self.level]:
-            obj[f] = getattr(self, f)
+        self.log('save %s %s', obj['_type'], unicode(obj))
+
+        # copy jurisdiction to LEVEL_FIELD
+        obj[settings.LEVEL_FIELD] = getattr(self, 'jurisdiction')
 
         filename = obj.get_filename()
-        with open(os.path.join(self.output_dir, self.scraper_type, filename),
+        self.output_names.add(filename)     # keep tally of all output names
+
+        # pluralize type
+        if obj['_type'] == 'speech':
+            data_dir = 'speeches'
+        elif obj['_type'] == 'person':
+            data_dir = 'legislators'
+        else:
+            data_dir = obj['_type'] + 's'
+
+        with open(os.path.join(self.output_dir, data_dir, filename),
                   'w') as f:
-            json.dump(obj, f, cls=JSONDateEncoder)
+            json.dump(obj, f, cls=JSONEncoderPlus)
 
         # validate after writing, allows for inspection
         self.validate_json(obj)
@@ -247,7 +254,7 @@ def get_scraper(mod_path, scraper_type):
     # act of importing puts it into the registry
     try:
         mod_path = '%s.%s' % (mod_path, scraper_type)
-        __import__(mod_path)
+        importlib.import_module(mod_path)
     except ImportError as e:
         raise ScrapeError("could not import %s" % mod_path, e)
 
@@ -255,14 +262,14 @@ def get_scraper(mod_path, scraper_type):
     try:
         ScraperClass = _scraper_registry[scraper_type]
     except KeyError as e:
-        raise ScrapeError("no %s scraper found in module %s" %
-                           (scraper_type, mod_path))
+        raise ScrapeError("no %s scraper found in module %s" % (
+            scraper_type, mod_path))
     return ScraperClass
 
 
 def check_sessions(metadata, sessions):
     all_sessions_in_terms = list(reduce(lambda x, y: x + y,
-                                   [x['sessions'] for x in metadata['terms']]))
+                                 [x['sessions'] for x in metadata['terms']]))
     # copy the list to avoid modifying it
     metadata_session_details = list(metadata.get('_ignored_scraped_sessions',
                                                  []))

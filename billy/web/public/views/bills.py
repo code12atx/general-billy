@@ -1,0 +1,431 @@
+import urllib
+import pymongo
+
+from django.shortcuts import render, redirect
+from django.http import Http404, HttpResponse, HttpResponseRedirect
+from django.core.urlresolvers import reverse
+from django.utils.feedgenerator import Rss201rev2Feed
+
+from billy.core import settings
+from billy.utils import popularity, fix_bill_id
+from billy.models import db, Metadata, Bill
+from billy.models.pagination import CursorPaginator, IteratorPaginator
+
+from ..forms import get_filter_bills_form
+from .utils import templatename, RelatedObjectsList
+from .search import search_by_bill_id
+
+
+EVENT_PAGE_COUNT = 10
+
+
+class RelatedBillsList(RelatedObjectsList):
+    show_per_page = 10
+    use_table = True
+    list_item_context_name = 'bill'
+    paginator = CursorPaginator
+    rowtemplate_name = templatename('bills_list_row')
+    nav_active = 'bills'
+    column_headers_tmplname = None      # not used
+    defer_rendering_title = True
+
+    def get_context_data(self, *args, **kwargs):
+        '''
+        Context:
+            If GET parameters are given:
+            - search_text
+            - form (FilterBillsForm)
+            - long_description
+            - description
+            - get_params
+            Otherwise, the only context item is an unbound FilterBillsForm.
+
+        Templates:
+            - Are specified in subclasses.
+        '''
+        context = super(RelatedBillsList, self).get_context_data(*args,
+                                                                 **kwargs)
+        metadata = context['metadata']
+        FilterBillsForm = get_filter_bills_form(metadata)
+
+        if self.request.GET:
+            form = FilterBillsForm(self.request.GET)
+            search_text = form.data.get('search_text')
+            context.update(search_text=search_text)
+            context.update(form=FilterBillsForm(self.request.GET))
+
+            # human readable description of search
+            description = []
+            if metadata:
+                description.append(metadata['name'])
+            else:
+                description = ['Search All']
+            long_description = []
+            chamber = form.data.getlist('chamber')
+            session = form.data.get('session')
+            type = form.data.get('type')
+            status = form.data.get('status')
+            sponsor = form.data.get('sponsor__leg_id')
+            if len(chamber) == 1:
+                if metadata:
+                    description.append(metadata['chambers'][chamber[0]]['name']
+                                      )
+                else:
+                    description.extend([chamber[0].title(), 'Chamber'])
+            description.append((type or 'Bill') + 's')
+            if session:
+                description.append(
+                    '(%s)' %
+                    metadata['session_details'][session]['display_name']
+                )
+            if status == 'passed_lower':
+                long_description.append('which have passed the ' +
+                                        metadata['chambers']['lower']['name'])
+            elif status == 'passed_upper':
+                long_description.append('which have passed the ' +
+                                        metadata['chambers']['upper']['name'])
+            elif status == 'signed':
+                long_description.append('which have been signed into law')
+            if sponsor:
+                leg = db.legislators.find_one({'_all_ids': sponsor},
+                                              fields=('full_name', '_id'))
+                leg = leg['full_name']
+                long_description.append('sponsored by ' + leg)
+            if search_text:
+                long_description.append('containing the term "{0}"'.format(
+                    search_text))
+            context.update(long_description=long_description)
+        else:
+            if metadata:
+                description = [metadata['name'], 'Bills']
+            else:
+                description = ['All Bills']
+            context.update(form=FilterBillsForm())
+
+        context.update(description=' '.join(description))
+
+        # Add the correct path to paginated links.
+        params = dict(self.request.GET.items())
+        if 'page' in params:
+            del params['page']
+        context.update(get_params=urllib.urlencode(params))
+
+        # Add the abbr.
+        context['abbr'] = self.kwargs['abbr']
+        return context
+
+    def get_queryset(self):
+        abbr = self.kwargs['abbr']
+        if abbr != 'all':
+            metadata = Metadata.get_object(abbr)
+        else:
+            metadata = None
+        FilterBillsForm = get_filter_bills_form(metadata)
+
+        # start with the spec
+        spec = {}
+        if abbr != 'all':
+            spec['abbr'] = abbr
+
+        # Setup the paginator.
+        get = self.request.GET.get
+        show_per_page = getattr(self, 'show_per_page', 10)
+        show_per_page = int(get('show_per_page', show_per_page))
+        page = int(get('page', 1))
+        if show_per_page > 100:
+            show_per_page = 100
+
+        # If search params are given:
+        form = FilterBillsForm(self.request.GET)
+
+        # First try to get by bill_id.
+        search_text = form.data.get('search_text')
+        if search_text:
+            found_by_bill_id = search_by_bill_id(self.kwargs['abbr'],
+                                                 search_text)
+            if found_by_bill_id:
+                return IteratorPaginator(found_by_bill_id)
+
+        chamber = form.data.get('chamber')
+        if chamber:
+            spec['chamber'] = chamber
+
+        subjects = form.data.get('subjects')
+        if subjects:
+            spec['subjects'] = {'$all': [filter(None, subjects)]}
+
+        sponsor_id = form.data.get('sponsor__leg_id')
+        if sponsor_id:
+            spec['sponsor_id'] = sponsor_id
+
+        status = form.data.get('status')
+        if status:
+            spec['status'] = {'action_dates.%s' % status: {'$ne': None}}
+
+        type_ = form.data.get('type')
+        if type_:
+            spec['type_'] = type_
+
+        session = form.data.get('session')
+        if session:
+            spec['session'] = session
+
+        cursor = Bill.search(search_text, **spec)
+
+        sort = self.request.GET.get('sort', 'last')
+        if sort not in ('first', 'last', 'signed', 'passed_upper',
+                        'passed_lower'):
+            sort = 'last'
+        sort_key = 'action_dates.{0}'.format(sort)
+
+        # do sorting on the cursor
+        cursor.sort([(sort_key, pymongo.DESCENDING)])
+
+        return self.paginator(cursor, page=page,
+                              show_per_page=show_per_page)
+
+    def get(self, request, *args, **kwargs):
+        # hack to redirect to proper legislator if sponsor_id is an alias
+        if 'sponsor__leg_id' in request.GET:
+            _id = request.GET.get('sponsor__leg_id')
+            leg = db.legislators.find_one({'_all_ids': _id})
+            if leg and leg['_id'] != _id:
+                new_get = request.GET.copy()
+                new_get['sponsor__leg_id'] = leg['_id']
+                return HttpResponseRedirect('?'.join(
+                    (reverse('bills', args=args, kwargs=kwargs),
+                     new_get.urlencode())))
+        return super(RelatedBillsList, self).get(request, *args, **kwargs)
+
+
+class BillList(RelatedBillsList):
+    '''
+    Context:
+        - Determined by RelatedBillsList.get_context_data
+
+    Teamplates:
+    - billy/web/public/bills_list.html
+    - billy/web/public/_pagination.html
+    - billy/web/public/bills_list_row.html
+    '''
+    template_name = templatename('bills_list')
+    collection_name = 'metadata'
+    query_attr = 'bills'
+    paginator = CursorPaginator
+    description_template = '''NOT USED'''
+    title_template = 'Search bills - {{ metadata.legislature_name }}'
+
+
+class AllBillList(RelatedBillsList):
+    '''
+    Context:
+        - Determined by RelatedBillsList.get_context_data
+
+    Teamplates:
+    - billy/web/public/bills_list.html
+    - billy/web/public/_pagination.html
+    - billy/web/public/bills_list_row_with_abbr_and_session.html
+    '''
+    template_name = templatename('bills_list')
+    rowtemplate_name = templatename('bills_list_row_with_abbr_and_session')
+    collection_name = 'bills'
+    paginator = CursorPaginator
+    use_table = True
+    description_template = '''NOT USED'''
+    title_template = ('Search All Bills')
+
+
+class BillFeed(BillList):
+    """ does everything BillList does but outputs as RSS """
+
+    show_per_page = 100
+
+    def get(self, request, *args, **kwargs):
+        context = self.get_context_data(*args, **kwargs)
+        queryset = self.get_queryset()
+        link = 'http://%s%s?%s' % (request.META['SERVER_NAME'],
+                                   reverse('bills', args=args, kwargs=kwargs),
+                                   request.META['QUERY_STRING'])
+        feed_url = 'http://%s%s?%s' % (request.META['SERVER_NAME'],
+                                       reverse('bills_feed', args=args,
+                                               kwargs=kwargs),
+                                       request.META['QUERY_STRING'])
+        feed = Rss201rev2Feed(title=context['description'], link=link,
+                              feed_url=feed_url, ttl=360,
+                              description=context['description'] +
+                              '\n'.join(context.get('long_description', '')))
+        for item in queryset:
+            link = 'http://%s%s' % (request.META['SERVER_NAME'],
+                                    item.get_absolute_url())
+            feed.add_item(title=item['bill_id'], link=link, unique_id=link,
+                          description=item['title'])
+        return HttpResponse(feed.writeString('utf-8'),
+                            content_type='application/xml')
+
+
+def bill_noslug(request, abbr, bill_id):
+    bill = db.bills.find_one({'_id': bill_id})
+    if bill is None:
+        raise Http404("No such bill (%s)" % (bill_id))
+
+    return redirect('bill',
+                    abbr=abbr,
+                    session=bill['session'],
+                    bill_id=bill['bill_id'])
+
+
+def bill(request, abbr, session, bill_id):
+    '''
+    Context:
+        - vote_preview_row_template
+        - abbr
+        - metadata
+        - bill
+        - events
+        - show_all_sponsors
+        - sponsors
+        - sources
+        - nav_active
+
+    Templates:
+        - billy/web/public/bill.html
+        - billy/web/public/vote_preview_row.html
+    '''
+    # get fixed version
+    fixed_bill_id = fix_bill_id(bill_id)
+    # redirect if URL's id isn't fixed id without spaces
+    if fixed_bill_id.replace(' ', '') != bill_id:
+        return redirect('bill', abbr=abbr, session=session,
+                        bill_id=fixed_bill_id.replace(' ', ''))
+    bill = db.bills.find_one({settings.LEVEL_FIELD: abbr, 'session': session,
+                              'bill_id': fixed_bill_id})
+    if bill is None:
+        raise Http404('no bill found {0} {1} {2}'.format(abbr, session,
+                                                         bill_id))
+
+    events = db.events.find({
+        settings.LEVEL_FIELD: abbr,
+        "related_bills.bill_id": bill['_id']
+    }).sort("when", -1)
+    events = list(events)
+    if len(events) > EVENT_PAGE_COUNT:
+        events = events[:EVENT_PAGE_COUNT]
+
+    popularity.counter.inc('bills', bill['_id'], abbr=abbr, session=session)
+
+    show_all_sponsors = request.GET.get('show_all_sponsors')
+    if show_all_sponsors:
+        sponsors = bill.sponsors_manager
+    else:
+        sponsors = bill.sponsors_manager.first_fifteen
+
+    return render(
+        request, templatename('bill'),
+        dict(vote_preview_row_template=templatename('vote_preview_row'),
+             abbr=abbr,
+             metadata=Metadata.get_object(abbr),
+             bill=bill,
+             events=events,
+             show_all_sponsors=show_all_sponsors,
+             sponsors=sponsors,
+             sources=bill['sources'],
+             nav_active='bills'))
+
+
+def vote(request, abbr, vote_id):
+    '''
+    Context:
+        - abbr
+        - metadata
+        - bill
+        - vote
+        - nav_active
+
+    Templates:
+        - vote.html
+    '''
+    vote = db.votes.find_one(vote_id)
+    if vote is None:
+        raise Http404('no such vote: {0}'.format(vote_id))
+    bill = vote.bill()
+
+    return render(request, templatename('vote'),
+                  dict(abbr=abbr, metadata=Metadata.get_object(abbr),
+                       bill=bill,
+                       vote=vote,
+                       nav_active='bills'))
+
+
+def document(request, abbr, session, bill_id, doc_id):
+    '''
+    Context:
+        - abbr
+        - session
+        - bill
+        - version
+        - metadata
+        - nav_active
+
+    Templates:
+        - billy/web/public/document.html
+    '''
+    # get fixed version
+    fixed_bill_id = fix_bill_id(bill_id)
+    # redirect if URL's id isn't fixed id without spaces
+    if fixed_bill_id.replace(' ', '') != bill_id:
+        return redirect('document', abbr=abbr, session=session,
+                        bill_id=fixed_bill_id.replace(' ', ''), doc_id=doc_id)
+
+    bill = db.bills.find_one({settings.LEVEL_FIELD: abbr, 'session': session,
+                              'bill_id': fixed_bill_id})
+
+    for version in bill['versions']:
+        if version['doc_id'] == doc_id:
+            break
+    else:
+        raise Http404('No such document.')
+
+    return render(request, templatename('document'),
+                  dict(abbr=abbr, session=session, bill=bill, version=version,
+                       metadata=bill.metadata, nav_active='bills'))
+
+
+def bill_by_mongoid(request, id_):
+    bill = db.bills.find_one(id_)
+    return redirect(bill.get_absolute_url())
+
+
+def show_all(key):
+    '''
+    Context:
+        - abbr
+        - metadata
+        - bill
+        - sources
+        - nav_active
+
+    Templates:
+        - billy/web/public/bill_all_{key}.html
+            - where key is passed in, like "actions", etc.
+    '''
+    def func(request, abbr, session, bill_id, key):
+        # get fixed version
+        fixed_bill_id = fix_bill_id(bill_id)
+        # redirect if URL's id isn't fixed id without spaces
+        if fixed_bill_id.replace(' ', '') != bill_id:
+            return redirect('bill', abbr=abbr, session=session,
+                            bill_id=fixed_bill_id.replace(' ', ''))
+        bill = db.bills.find_one({settings.LEVEL_FIELD: abbr,
+                                  'session': session,
+                                  'bill_id': fixed_bill_id})
+        if bill is None:
+            raise Http404('no bill found {0} {1} {2}'.format(abbr, session,
+                                                             bill_id))
+        return render(request, templatename('bill_all_%s' % key),
+                      dict(abbr=abbr, metadata=Metadata.get_object(abbr),
+                           bill=bill, sources=bill['sources'],
+                           nav_active='bills'))
+    return func
+
+all_documents = show_all('documents')
+all_versions = show_all('versions')

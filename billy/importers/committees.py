@@ -5,8 +5,8 @@ import json
 import datetime
 import logging
 
-from billy import db
-from billy.conf import settings
+from billy.core import db
+from billy.core import settings
 from billy.importers.names import get_legislator_id
 from billy.importers.utils import prepare_obj, update, insert_with_id
 
@@ -17,27 +17,24 @@ logger = logging.getLogger('billy')
 
 def ensure_indexes():
     db.committees.ensure_index([('_all_ids', pymongo.ASCENDING)])
-    db.committees.ensure_index([('state', pymongo.ASCENDING),
+    db.committees.ensure_index([(settings.LEVEL_FIELD, pymongo.ASCENDING),
                                 ('committee', pymongo.ASCENDING),
                                 ('subcommittee', pymongo.ASCENDING)])
 
 
-def import_committees_from_legislators(current_term, level, abbr):
+def import_committees_from_legislators(current_term, abbr):
     """ create committees from legislators that have committee roles """
 
     # for all current legislators
-    for legislator in db.legislators.find({
-        'level': level,
-        'roles': {'$elemMatch': {'term': current_term,
-                                 level: abbr}}}):
+    for legislator in db.legislators.find({'roles': {'$elemMatch': {
+            'term': current_term, settings.LEVEL_FIELD: abbr}}}):
 
         # for all committee roles
         for role in legislator['roles']:
             if (role['type'] == 'committee member' and
-                'committee_id' not in role):
+                    'committee_id' not in role):
 
-                spec = {'level': level,
-                        level: abbr,
+                spec = {settings.LEVEL_FIELD: abbr,
                         'chamber': role['chamber'],
                         'committee': role['committee']}
                 if 'subcommittee' in role:
@@ -48,9 +45,9 @@ def import_committees_from_legislators(current_term, level, abbr):
                 if not committee:
                     committee = spec
                     committee['_type'] = 'committee'
-                    # copy required fields from legislator to committee
-                    for f in settings.BILLY_LEVEL_FIELDS:
-                        committee[f] = legislator[f]
+                    # copy LEVEL_FIELD from legislator to committee
+                    committee[settings.LEVEL_FIELD] = \
+                        legislator[settings.LEVEL_FIELD]
                     committee['members'] = []
                     committee['sources'] = []
                     if 'subcommittee' not in committee:
@@ -65,6 +62,9 @@ def import_committees_from_legislators(current_term, level, abbr):
                         {'name': legislator['full_name'],
                          'leg_id': legislator['leg_id'],
                          'role': role.get('position') or 'member'})
+                    for source in legislator['sources']:
+                        if source not in committee['sources']:
+                            committee['sources'].append(source)
                     db.committees.save(committee, safe=True)
 
                     role['committee_id'] = committee['_id']
@@ -73,10 +73,8 @@ def import_committees_from_legislators(current_term, level, abbr):
 
 
 def import_committee(data, current_session, current_term):
-    level = data['level']
-    abbr = data[level]
-    spec = {'level': level,
-            level: abbr,
+    abbr = data[settings.LEVEL_FIELD]
+    spec = {settings.LEVEL_FIELD: abbr,
             'chamber': data['chamber'],
             'committee': data['committee']}
     if 'subcommittee' in data:
@@ -100,8 +98,7 @@ def import_committee(data, current_session, current_term):
         if not member['name']:
             continue
 
-        leg_id = get_legislator_id(abbr, current_session,
-                                   data['chamber'],
+        leg_id = get_legislator_id(abbr, current_session, data['chamber'],
                                    member['name'])
 
         if not leg_id:
@@ -110,19 +107,23 @@ def import_committee(data, current_session, current_term):
             member['leg_id'] = None
             continue
 
-        legislator = db.legislators.find_one({'_id': leg_id})
+        legislator = db.legislators.find_one({'_all_ids': leg_id})
 
         if not legislator:
             logger.warning('No legislator with ID %s' % leg_id)
             member['leg_id'] = None
             continue
 
-        member['leg_id'] = leg_id
+        member['leg_id'] = legislator['_id']
 
         for role in legislator['roles']:
             if (role['type'] == 'committee member' and
-                role['term'] == current_term and
-                role.get('committee_id') == committee['_id']):
+                    role['term'] == current_term and
+                    role.get('committee_id') == committee['_id']):
+                # if the position hadn't been copied over before, copy it now
+                if role.get('position') != member['role']:
+                    role['position'] = member['role']
+                    db.legislators.save(legislator, safe=True)
                 break
         else:
             new_role = {'type': 'committee member',
@@ -130,11 +131,9 @@ def import_committee(data, current_session, current_term):
                         'term': current_term,
                         'chamber': committee['chamber'],
                         'committee_id': committee['_id'],
-                        'level': level,
-                       }
+                        'position': member['role']}
             # copy over all necessary fields from committee
-            for f in settings.BILLY_LEVEL_FIELDS:
-                new_role[f] = committee[f]
+            new_role[settings.LEVEL_FIELD] = committee[settings.LEVEL_FIELD]
 
             if 'subcommittee' in committee:
                 new_role['subcommittee'] = committee['subcommittee']
@@ -159,17 +158,16 @@ def import_committees(abbr, data_dir):
     meta = db.metadata.find_one({'_id': abbr})
     current_term = meta['terms'][-1]['name']
     current_session = meta['terms'][-1]['sessions'][-1]
-    level = meta['level']
 
     paths = glob.glob(pattern)
 
-    for committee in db.committees.find({'level': level, level: abbr}):
+    for committee in db.committees.find({settings.LEVEL_FIELD: abbr}):
         committee['members'] = []
         db.committees.save(committee, safe=True)
 
     # import committees from legislator roles, no standalone committees scraped
     if not paths:
-        import_committees_from_legislators(current_term, level, abbr)
+        import_committees_from_legislators(current_term, abbr)
 
     for path in paths:
         with open(path) as f:
@@ -181,20 +179,19 @@ def import_committees(abbr, data_dir):
 
     logger.info('imported %s committee files' % len(paths))
 
-    link_parents(level, abbr)
+    link_parents(abbr)
 
     ensure_indexes()
     return counts
 
 
-def link_parents(level, abbr):
-    for comm in db.committees.find({'level': level, level: abbr}):
+def link_parents(abbr):
+    for comm in db.committees.find({settings.LEVEL_FIELD: abbr}):
         sub = comm.get('subcommittee')
         if not sub:
             comm['parent_id'] = None
         else:
-            parent = db.committees.find_one({'level': level,
-                                             level: abbr,
+            parent = db.committees.find_one({settings.LEVEL_FIELD: abbr,
                                              'chamber': comm['chamber'],
                                              'committee': comm['committee']})
             if not parent:

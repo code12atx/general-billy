@@ -1,31 +1,28 @@
 import argparse
 import logging
+import importlib
 
-from billy.conf import settings, base_arg_parser
-from billy.utils import configure_logging
+from billy.core import settings, base_arg_parser
 from billy.commands import BaseCommand
 
 logger = logging.getLogger('billy')
-configure_logging()
 
 COMMAND_MODULES = (
     # lots of these commands can go away as billy matures
-    'billy.commands.serve',             # useful for development
     'billy.commands.textextract',       # useful for development
-    'billy.commands.load_legislators',  # allow editing legislators in admin
-    'billy.commands.prune_committees',  # allow deleting committees in admin
-    'billy.commands.retire',            # allow retiring legislators in admin
+    'billy.commands.download_photos',
     'billy.commands.dump',
     'billy.commands.update_external_ids',
     'billy.commands.update_leg_ids',
     'billy.commands.validate_api',
+    'billy.commands.sync_versions',
 )
 
 
 def import_command_module(mod):
     try:
-        __import__(mod)
-    except ImportError, e:
+        importlib.import_module(mod)
+    except ImportError as e:
         logger.warning(
             'error "{0}" prevented loading of {1} module'.format(e, mod))
 
@@ -47,7 +44,6 @@ def main():
     # parse arguments, update settings, then run the appropriate function
     args = parser.parse_args()
     settings.update(args)
-    configure_logging(args.subcommand)
     subcommands[args.subcommand].handle(args)
 
 if __name__ == '__main__':
